@@ -1,0 +1,22 @@
+[package]
+name = "bedcare"
+version = "1.0.0"
+description = "BEDCARE — Phần mềm quản lý giường bệnh và phòng bệnh toàn diện (Local-first P2P)"
+authors = ["BEDCARE Engineering Team"]
+license = "MIT"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+ed25519-dalek = "2.1"
+aes-gcm = "0.10"
+libp2p = { version = "0.54", features = ["tokio", "mdns", "tcp", "noise", "yamux", "gossipsub"] }
+tokio = { version = "1", features = ["full"] }

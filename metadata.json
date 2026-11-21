@@ -1,0 +1,6 @@
+{
+  "name": "BEDCARE",
+  "description": "Phần mềm quản lý giường bệnh và phòng bệnh toàn diện theo kiến trúc Local-first Peer-to-Peer.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

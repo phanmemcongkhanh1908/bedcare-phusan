@@ -1,0 +1,154 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Public Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  body {
+    font-family: var(--font-sans);
+    color: #0f172a;
+    background-color: #f8fafc;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-display);
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.print-only {
+  display: none;
+}
+
+@media print {
+  @page {
+    margin: 10mm;
+  }
+  .no-print {
+    display: none !important;
+  }
+  .print-only {
+    display: block !important;
+  }
+  body {
+    background: #ffffff !important;
+    color: #0f172a !important;
+  }
+  body.bedcare-print-preview-open > #root {
+    display: none !important;
+  }
+  body.bedcare-print-preview-open .bedcare-print-preview-root {
+    position: static !important;
+    inset: auto !important;
+    display: block !important;
+    background: #ffffff !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    width: 100% !important;
+    max-width: none !important;
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+  }
+  body.bedcare-print-preview-open .bedcare-print-sheet {
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    width: 100% !important;
+    max-width: none !important;
+    zoom: 1 !important;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+  }
+  thead {
+    display: table-header-group;
+  }
+  tr {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  th,
+  td {
+    page-break-inside: avoid;
+  }
+  body.printing-bedcard .no-print-during-bedcard {
+    display: none !important;
+  }
+  body.printing-bedcard .bedcard-print-sheet {
+    position: static !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 8mm !important;
+    border: 2px solid #0f172a !important;
+    box-shadow: none !important;
+    break-inside: avoid;
+  }
+}
+
+/* Chế độ Tương phản cao (High Contrast Mode) cho phòng bệnh ánh sáng mạnh */
+html.high-contrast body {
+  background-color: #ffffff !important;
+  color: #000000 !important;
+}
+
+html.high-contrast main,
+html.high-contrast header,
+html.high-contrast aside,
+html.high-contrast nav {
+  border-color: #0f172a !important;
+}
+
+html.high-contrast .bg-white,
+html.high-contrast .bg-slate-50,
+html.high-contrast .bg-slate-50\/40,
+html.high-contrast .bg-slate-50\/50,
+html.high-contrast .bg-slate-50\/60,
+html.high-contrast .bg-slate-50\/70 {
+  background-color: #ffffff !important;
+}
+
+html.high-contrast .border-slate-100,
+html.high-contrast .border-slate-200,
+html.high-contrast .border-slate-300 {
+  border-color: #0f172a !important;
+  border-width: 1.5px;
+}
+
+html.high-contrast .text-slate-400,
+html.high-contrast .text-slate-500,
+html.high-contrast .text-slate-600 {
+  color: #1e293b !important;
+}
+
+html.high-contrast .text-slate-700,
+html.high-contrast .text-slate-800,
+html.high-contrast .text-slate-900 {
+  color: #000000 !important;
+}
+
+html.high-contrast input,
+html.high-contrast select,
+html.high-contrast textarea {
+  border: 2px solid #0f172a !important;
+  background-color: #ffffff !important;
+  color: #000000 !important;
+}
+
+html.high-contrast button:focus-visible,
+html.high-contrast a:focus-visible,
+html.high-contrast input:focus-visible,
+html.high-contrast select:focus-visible {
+  outline: 3px solid #0369a1 !important;
+  outline-offset: 2px;
+}
+

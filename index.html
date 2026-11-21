@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      (function () {
+        try {
+          window.addEventListener(
+            'error',
+            function (event) {
+              var src = (event && event.filename) || '';
+              var msg = (event && event.message) || '';
+              if (
+                src.indexOf('chrome-extension://') === 0 ||
+                src.indexOf('moz-extension://') === 0 ||
+                msg.indexOf('chrome-extension://') !== -1
+              ) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+              }
+            },
+            true
+          );
+
+          var ownDesc = Object.getOwnPropertyDescriptor(window, 'fetch');
+          var protoDesc =
+            typeof Window !== 'undefined' && Window.prototype
+              ? Object.getOwnPropertyDescriptor(Window.prototype, 'fetch')
+              : undefined;
+          var activeDesc = ownDesc || protoDesc;
+
+          if (
+            activeDesc &&
+            !activeDesc.writable &&
+            typeof activeDesc.get === 'function' &&
+            !activeDesc.set &&
+            (!ownDesc || ownDesc.configurable)
+          ) {
+            var originalGet = activeDesc.get;
+            var assignedFetch = null;
+            Object.defineProperty(window, 'fetch', {
+              configurable: true,
+              enumerable: activeDesc.enumerable !== false,
+              get: function () {
+                return assignedFetch || originalGet.call(window);
+              },
+              set: function (nextFetch) {
+                if (typeof nextFetch === 'function') {
+                  assignedFetch = nextFetch;
+                }
+              },
+            });
+          }
+        } catch (_err) {
+          // Ignore non-configurable host descriptors
+        }
+      })();
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#0369a1" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="BEDCARE" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <title>BEDCARE — Hệ thống Quản lý Giường bệnh & Phòng bệnh</title>
+    <meta name="description" content="Phần mềm quản lý giường bệnh và phòng bệnh toàn diện theo kiến trúc Local-first Peer-to-Peer cho bệnh viện." />
+    <meta property="og:title" content="BEDCARE — Hệ thống Quản lý Giường bệnh & Phòng bệnh" />
+    <meta property="og:description" content="Phần mềm quản lý giường bệnh và phòng bệnh toàn diện theo kiến trúc Local-first Peer-to-Peer cho bệnh viện." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@500;600;700&family=Public+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  </head>
+  <body class="bg-slate-50 text-slate-900 antialiased selection:bg-sky-100 selection:text-sky-900">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

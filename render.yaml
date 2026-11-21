@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: bedcare-hospital-bed-management
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: BEDCARE_AUTH_SECRET
+        generateValue: true
+      - key: BEDCARE_BACKUP_KEY
+        generateValue: true
