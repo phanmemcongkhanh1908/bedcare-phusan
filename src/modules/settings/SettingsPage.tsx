@@ -8,6 +8,8 @@ import {
   DoorOpen,
   Fan,
   Plus,
+  QrCode,
+  Server,
   Settings2,
   SlidersHorizontal,
   Tv,
@@ -15,6 +17,7 @@ import {
 import { useEffect, useState, type FormEvent } from 'react';
 import { HIGH_CONTRAST_EVENT } from '../../App';
 import { ConfirmModal } from '../../components/ConfirmModal';
+import { PortalQrPosterStudio } from './PortalQrPosterStudio';
 import { apiFetch } from '../../services/api';
 import type {
   Bed,
@@ -27,6 +30,16 @@ import type {
   UserRole,
 } from '../../types/bedcare';
 import { formatDateTimeVN } from '../../utils/formatters';
+import {
+  clearServiceOutage,
+  getAutoSwitchFailover,
+  getFailoverServerUrl,
+  isUsingFailoverServer,
+  normalizeServerBaseUrl,
+  setActiveFailoverMode,
+  setAutoSwitchFailover,
+  setFailoverServerUrl,
+} from '../../utils/networkResilience';
 
 interface SettingsPageProps {
   userRole: UserRole;
@@ -34,7 +47,7 @@ interface SettingsPageProps {
   onDataChanged: () => void;
 }
 
-type AdminTab = 'departments' | 'rooms' | 'bed_types' | 'standards' | 'system';
+type AdminTab = 'departments' | 'rooms' | 'bed_types' | 'standards' | 'portal_qr' | 'system';
 
 export function SettingsPage({ userRole, onNotify, onDataChanged }: SettingsPageProps) {
   const [activeTab, setActiveTab] = useState<AdminTab>('departments');
@@ -53,6 +66,11 @@ export function SettingsPage({ userRole, onNotify, onDataChanged }: SettingsPage
   const [newDiagName, setNewDiagName] = useState('');
   const [newDiagDays, setNewDiagDays] = useState(3);
   const [confirmClearDemo, setConfirmClearDemo] = useState(false);
+  const [failoverUrlInput, setFailoverUrlInput] = useState(() => getFailoverServerUrl());
+  const [autoFailover, setAutoFailover] = useState(() => getAutoSwitchFailover());
+  const [usingFailover, setUsingFailover] = useState(() => isUsingFailoverServer());
+  const [testingFailover, setTestingFailover] = useState(false);
+  const [failoverHealthMsg, setFailoverHealthMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [highContrast, setHighContrast] = useState<boolean>(
     () => typeof window !== 'undefined' && localStorage.getItem('bedcare_high_contrast') === 'true'
   );
@@ -350,11 +368,69 @@ export function SettingsPage({ userRole, onNotify, onDataChanged }: SettingsPage
     }
   };
 
+  const handleSaveFailoverConfig = (e: FormEvent) => {
+    e.preventDefault();
+    try {
+      const normalized = setFailoverServerUrl(failoverUrlInput);
+      setFailoverUrlInput(normalized);
+      setAutoSwitchFailover(autoFailover);
+      if (!normalized) {
+        setUsingFailover(false);
+      }
+      setFailoverHealthMsg(null);
+      onNotify(
+        normalized
+          ? `Đã lưu địa chỉ Máy chủ Dự phòng: ${normalized}`
+          : 'Đã xóa cấu hình Máy chủ Dự phòng.'
+      );
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  };
+
+  const handleTestFailoverHealth = async () => {
+    setFailoverHealthMsg(null);
+    let base: string;
+    try {
+      base = normalizeServerBaseUrl(failoverUrlInput);
+      if (!base) {
+        setFailoverHealthMsg({ ok: false, text: 'Vui lòng nhập URL máy chủ dự phòng trước khi kiểm tra.' });
+        return;
+      }
+    } catch (err) {
+      setFailoverHealthMsg({ ok: false, text: (err as Error).message });
+      return;
+    }
+
+    setTestingFailover(true);
+    try {
+      const started = Date.now();
+      const res = await fetch(`${base}/api/health`);
+      const json = (await res.json().catch(() => ({}))) as { ok?: boolean; activeNodeId?: string };
+      const latency = Date.now() - started;
+      if (!res.ok || !json.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      setFailoverHealthMsg({
+        ok: true,
+        text: `Kết nối tốt (${latency}ms · Nút: ${json.activeNodeId || 'OK'}). Sẵn sàng dự phòng khi Render quá tải.`,
+      });
+    } catch (err) {
+      setFailoverHealthMsg({
+        ok: false,
+        text: `Không kết nối được tới ${base}/api/health (${err instanceof Error ? err.message : 'Lỗi mạng'}).`,
+      });
+    } finally {
+      setTestingFailover(false);
+    }
+  };
+
   const tabs: Array<{ id: AdminTab; label: string; icon: typeof Building2 }> = [
     { id: 'departments', label: 'Khoa / Khu vực', icon: Building2 },
     { id: 'rooms', label: 'Phòng theo khoa', icon: DoorOpen },
     { id: 'bed_types', label: 'Loại giường & Giá giường', icon: BedDouble },
     { id: 'standards', label: 'Tiêu chuẩn phòng', icon: SlidersHorizontal },
+    { id: 'portal_qr', label: 'QR Cổng đặt giường', icon: QrCode },
     { id: 'system', label: 'Quy tắc & Hệ thống', icon: Settings2 },
   ];
 
@@ -1200,6 +1276,109 @@ export function SettingsPage({ userRole, onNotify, onDataChanged }: SettingsPage
             </form>
           </div>
 
+          <form onSubmit={handleSaveFailoverConfig} className="rounded-lg border border-sky-200 bg-sky-50/40 p-6 space-y-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="flex items-start gap-2.5">
+                <Server className="h-5 w-5 text-sky-700 shrink-0 mt-0.5" />
+                <div>
+                  <h3 className="text-base font-semibold text-slate-900">
+                    3. Cơ chế Dự phòng &amp; Chống quá tải hạn mức (Render Free Failover)
+                  </h3>
+                  <p className="text-xs text-slate-600 mt-0.5">
+                    Thiết lập máy chủ dự phòng (Render tài khoản phụ, Koyeb, Hugging Face hoặc máy LAN nội bộ qua Cloudflare Tunnel) để hệ thống tự chuyển hướng khi máy chủ chính quá tải/hết băng thông tháng.
+                  </p>
+                </div>
+              </div>
+              {getFailoverServerUrl() && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = !usingFailover;
+                    setActiveFailoverMode(next);
+                    if (!next) clearServiceOutage();
+                    setUsingFailover(next);
+                    onNotify(next ? 'Đã chuyển sang dùng Máy chủ Dự phòng.' : 'Đã quay lại Máy chủ Chính.');
+                  }}
+                  className={`rounded-md px-3 py-1.5 text-xs font-semibold border whitespace-nowrap ${
+                    usingFailover
+                      ? 'border-sky-700 bg-sky-700 text-white'
+                      : 'border-sky-300 bg-white text-sky-800 hover:bg-sky-50'
+                  }`}
+                >
+                  {usingFailover ? 'Đang dùng Dự phòng (Bấm để về Chính)' : 'Chuyển sang Dự phòng ngay'}
+                </button>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
+              <div className="md:col-span-2">
+                <label htmlFor="failover-url-input" className="block text-xs font-medium text-slate-700 mb-1">
+                  Địa chỉ URL Máy chủ Dự phòng (Warm-Standby)
+                </label>
+                <input
+                  id="failover-url-input"
+                  type="url"
+                  value={failoverUrlInput}
+                  onChange={(e) => setFailoverUrlInput(e.target.value)}
+                  placeholder="https://bedcare-duphong.onrender.com hoặc https://bedcare-noi-bo.trycloudflare.com"
+                  className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-mono"
+                />
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={handleTestFailoverHealth}
+                  disabled={testingFailover}
+                  className="rounded-md border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-60"
+                >
+                  {testingFailover ? 'Đang kiểm...' : 'Kiểm tra /api/health'}
+                </button>
+                <button
+                  type="submit"
+                  className="rounded-md bg-sky-700 px-4 py-2 text-xs font-semibold text-white hover:bg-sky-800"
+                >
+                  Lưu Dự phòng
+                </button>
+              </div>
+            </div>
+
+            <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={autoFailover}
+                onChange={(e) => {
+                  setAutoFailover(e.target.checked);
+                  setAutoSwitchFailover(e.target.checked);
+                }}
+                className="rounded border-slate-300 text-sky-700"
+              />
+              <span>Tự động chuyển sang Máy chủ Dự phòng ngay khi máy chủ chính trả lỗi 429 / 502 / 503 hoặc mất kết nối</span>
+            </label>
+
+            {failoverHealthMsg && (
+              <div
+                role="status"
+                className={`rounded-md border px-3 py-2 text-xs font-medium ${
+                  failoverHealthMsg.ok
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                    : 'border-rose-200 bg-rose-50 text-rose-800'
+                }`}
+              >
+                {failoverHealthMsg.text}
+              </div>
+            )}
+
+            <div className="rounded-md border border-slate-200 bg-white p-3 text-xs text-slate-600 space-y-1">
+              <div className="font-semibold text-slate-800">Các chốt chặn chống gửi request liên tục làm hết hạn mức Render đang bật:</div>
+              <ul className="list-disc pl-5 space-y-0.5">
+                <li>Tự ngắt WebSocket khi nhân viên hoặc khách hàng ẩn tab/khóa màn hình điện thoại; chỉ kết nối lại khi mở lại.</li>
+                <li>Backoff lũy tiến (3s → 6s → 12s → ... → 90s) và tự dừng hẳn sau 8 lần mất kết nối, tránh vòng lặp vô hạn.</li>
+                <li>Ngắt tự động gửi lại hàng chờ Offline khi gặp lỗi 4xx hoặc 429/503, kèm bộ nhớ đệm đọc cục bộ khi máy chủ chính gián đoạn.</li>
+                <li>Gom sự kiện đồng bộ phía máy chủ (300ms) và cache tài sản tĩnh dài hạn (365 ngày) giúp giảm tối đa băng thông Render Free.</li>
+              </ul>
+            </div>
+          </form>
+
           {userRole === 'SUPER_ADMIN' && (
             <div className="rounded-lg border border-rose-200 bg-rose-50/50 p-5 flex flex-wrap items-center justify-between gap-4">
               <div>
@@ -1258,6 +1437,10 @@ export function SettingsPage({ userRole, onNotify, onDataChanged }: SettingsPage
             onCancel={() => setConfirmClearDemo(false)}
           />
         </div>
+      )}
+
+      {activeTab === 'portal_qr' && (
+        <PortalQrPosterStudio departments={departments} onNotify={onNotify} />
       )}
     </div>
   );

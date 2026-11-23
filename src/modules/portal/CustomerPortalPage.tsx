@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   ArrowRight,
   BedDouble,
   CalendarClock,
@@ -17,6 +18,21 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import type { BedType, DiagnosisConfig, RoomStandard } from '../../types/bedcare';
 import { formatDateTimeVN, toLocalDateTimeInputValue } from '../../utils/formatters';
+import {
+  clearServiceOutage,
+  computeWsReconnectDelayMs,
+  detectServiceOutage,
+  getAutoSwitchFailover,
+  getFailoverServerUrl,
+  isServiceInOutageCooldown,
+  isUsingFailoverServer,
+  loadReadCache,
+  recordServiceOutage,
+  resolveApiUrl,
+  resolveWsUrl,
+  saveReadCache,
+  setActiveFailoverMode,
+} from '../../utils/networkResilience';
 
 interface PublicVacantBed {
   id: string;
@@ -162,7 +178,9 @@ export function CustomerPortalPage({ onGoToStaffLogin }: CustomerPortalPageProps
   // Navigation & filter state
   const [mobileSection, setMobileSection] = useState<'BROWSE' | 'BOOKING'>('BROWSE');
   const [searchQuery, setSearchQuery] = useState('');
-  const [deptFilter, setDeptFilter] = useState('');
+  const [deptFilter, setDeptFilter] = useState(() =>
+    typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('dept')?.trim() || '' : ''
+  );
   const [tierFilter, setTierFilter] = useState<RoomTierFilter>('ALL');
   const [sortMode, setSortMode] = useState<SortMode>('PRICE_ASC');
   const [selectedStdIds, setSelectedStdIds] = useState<string[]>([]);
@@ -196,15 +214,84 @@ export function CustomerPortalPage({ onGoToStaffLogin }: CustomerPortalPageProps
   const [lookupError, setLookupError] = useState('');
 
   const diagInitializedRef = useRef(false);
+  const deptDeepLinkAppliedRef = useRef(false);
+  const inFlightAvailabilityRef = useRef(false);
+  const [cachedNoticeAt, setCachedNoticeAt] = useState<string | null>(null);
 
-  const loadAvailability = useCallback(async () => {
+  const loadAvailability = useCallback(async (manualRefresh = false) => {
+    if (inFlightAvailabilityRef.current) return;
+    if (!manualRefresh && isServiceInOutageCooldown()) {
+      const cached = loadReadCache<PublicAvailabilityPayload>('/public/availability');
+      if (cached) {
+        setData(cached.data);
+        setCachedNoticeAt(cached.savedAt);
+        setLoading(false);
+      }
+      return;
+    }
+
+    inFlightAvailabilityRef.current = true;
     setLoading(true);
     setError('');
     try {
-      const res = await fetch('/api/public/availability');
-      const json = (await res.json()) as PublicAvailabilityPayload & { error?: string };
+      let res = await fetch(resolveApiUrl('/public/availability'));
+      let rawText = await res.text().catch(() => '');
+      let outage = detectServiceOutage({
+        status: res.status,
+        contentType: res.headers.get('content-type'),
+        bodyText: rawText,
+        retryAfterHeader: res.headers.get('retry-after'),
+      });
+
+      if (outage.isOutage && getFailoverServerUrl() && !isUsingFailoverServer() && getAutoSwitchFailover()) {
+        try {
+          const backupUrl = `${getFailoverServerUrl()}/api/public/availability`;
+          const backupRes = await fetch(backupUrl);
+          const backupText = await backupRes.text().catch(() => '');
+          const backupOutage = detectServiceOutage({
+            status: backupRes.status,
+            contentType: backupRes.headers.get('content-type'),
+            bodyText: backupText,
+            retryAfterHeader: backupRes.headers.get('retry-after'),
+          });
+          if (!backupOutage.isOutage && backupRes.ok) {
+            setActiveFailoverMode(true);
+            res = backupRes;
+            rawText = backupText;
+            outage = backupOutage;
+          }
+        } catch {
+          // Keep primary outage notice
+        }
+      }
+
+      if (outage.isOutage) {
+        recordServiceOutage(outage.reason, res.status, outage.retryAfterMs);
+        throw new Error(outage.reason);
+      }
+
+      const json = (rawText ? JSON.parse(rawText) : {}) as PublicAvailabilityPayload & { error?: string };
       if (!res.ok) throw new Error(json.error || 'Không thể tải danh mục giường trống.');
+      clearServiceOutage();
+      saveReadCache('/public/availability', json);
+      setCachedNoticeAt(null);
       setData(json);
+      if (!deptDeepLinkAppliedRef.current) {
+        deptDeepLinkAppliedRef.current = true;
+        const urlDept =
+          typeof window !== 'undefined'
+            ? new URLSearchParams(window.location.search).get('dept')?.trim() || ''
+            : '';
+        if (urlDept) {
+          const matchedDept = json.departments.find((d) => d.id === urlDept);
+          if (matchedDept) {
+            setDeptFilter(matchedDept.id);
+            setBookingDeptId((prev) => prev || matchedDept.id);
+          } else {
+            setDeptFilter('');
+          }
+        }
+      }
       if (json.diagnoses.length > 0 && !diagInitializedRef.current) {
         diagInitializedRef.current = true;
         setDiagGroup((prev) =>
@@ -212,8 +299,16 @@ export function CustomerPortalPage({ onGoToStaffLogin }: CustomerPortalPageProps
         );
       }
     } catch (err) {
-      setError((err as Error).message);
+      const cached = loadReadCache<PublicAvailabilityPayload>('/public/availability');
+      if (cached) {
+        setData(cached.data);
+        setCachedNoticeAt(cached.savedAt);
+        setError(`${(err as Error).message} Đang hiển thị bảng phòng lưu tạm gần nhất.`);
+      } else {
+        setError((err as Error).message);
+      }
     } finally {
+      inFlightAvailabilityRef.current = false;
       setLoading(false);
     }
   }, []);
@@ -222,35 +317,94 @@ export function CustomerPortalPage({ onGoToStaffLogin }: CustomerPortalPageProps
     loadAvailability();
   }, [loadAvailability]);
 
-  // Listen for live updates over /ws/p2p so public vacancy reflects hospital actions immediately
+  // Listen for live updates over /ws/p2p ONLY when tab is visible, with exponential backoff + max attempts
   useEffect(() => {
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     let ws: WebSocket | null = null;
     let closed = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+    let attempt = 0;
+
+    const clearTimers = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (debounceTimer) {
+        clearTimeout(debounceTimer);
+        debounceTimer = null;
+      }
+    };
+
     const connect = () => {
       if (closed) return;
-      ws = new WebSocket(`${proto}//${window.location.host}/ws/p2p`);
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      if (!navigator.onLine || isServiceInOutageCooldown()) return;
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+
+      ws = new WebSocket(resolveWsUrl());
+      ws.onopen = () => {
+        attempt = 0;
+      };
       ws.onmessage = (evt) => {
         try {
           const msg = JSON.parse(String(evt.data)) as { type?: string };
           if (msg.type === 'CLUSTER_EVENT_SYNC') {
-            loadAvailability();
+            if (debounceTimer) clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => {
+              debounceTimer = null;
+              if (!closed && document.visibilityState !== 'hidden' && !isServiceInOutageCooldown()) {
+                loadAvailability();
+              }
+            }, 800);
           }
         } catch {
           // Ignore malformed WS message
         }
       };
       ws.onclose = () => {
-        if (!closed) {
-          timer = setTimeout(connect, 4000);
-        }
+        ws = null;
+        if (closed) return;
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+        if (!navigator.onLine || isServiceInOutageCooldown()) return;
+        attempt += 1;
+        const delayMs = computeWsReconnectDelayMs(attempt, {
+          maxAttempts: 6,
+          baseDelayMs: 4000,
+          maxDelayMs: 90_000,
+        });
+        if (delayMs === null) return;
+        timer = setTimeout(connect, delayMs);
       };
     };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        clearTimers();
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+          ws.close();
+          ws = null;
+        }
+      } else {
+        attempt = 0;
+        connect();
+      }
+    };
+
+    const onOnline = () => {
+      attempt = 0;
+      connect();
+    };
+
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('online', onOnline);
     connect();
+
     return () => {
       closed = true;
-      if (timer) clearTimeout(timer);
+      clearTimers();
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('online', onOnline);
       ws?.close();
     };
   }, [loadAvailability]);
@@ -407,7 +561,7 @@ export function CustomerPortalPage({ onGoToStaffLogin }: CustomerPortalPageProps
 
     setSubmitting(true);
     try {
-      const res = await fetch('/api/public/bookings', {
+      const res = await fetch(resolveApiUrl('/public/bookings'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -424,7 +578,18 @@ export function CustomerPortalPage({ onGoToStaffLogin }: CustomerPortalPageProps
           notes,
         }),
       });
-      const json = (await res.json()) as BookingResult & { error?: string };
+      const rawText = await res.text().catch(() => '');
+      const outage = detectServiceOutage({
+        status: res.status,
+        contentType: res.headers.get('content-type'),
+        bodyText: rawText,
+        retryAfterHeader: res.headers.get('retry-after'),
+      });
+      if (outage.isOutage) {
+        recordServiceOutage(outage.reason, res.status, outage.retryAfterMs);
+        throw new Error(`${outage.reason} Quý khách vui lòng thử lại sau hoặc gọi trực tiếp quầy Tiếp nhận bệnh viện.`);
+      }
+      const json = (rawText ? JSON.parse(rawText) : {}) as BookingResult & { error?: string };
       if (!res.ok) throw new Error(json.error || 'Không thể gửi đăng ký.');
 
       setBookingReceipt(json);
@@ -446,7 +611,7 @@ export function CustomerPortalPage({ onGoToStaffLogin }: CustomerPortalPageProps
       setPatientName('');
       setPhone('');
       setNotes('');
-      await loadAvailability();
+      await loadAvailability(true);
     } catch (err) {
       setSubmitError((err as Error).message);
     } finally {
@@ -462,8 +627,19 @@ export function CustomerPortalPage({ onGoToStaffLogin }: CustomerPortalPageProps
     setLookupError('');
     setLookupResult(null);
     try {
-      const res = await fetch(`/api/public/bookings/${encodeURIComponent(clean)}`);
-      const json = (await res.json()) as LookupBookingStatus & { error?: string };
+      const res = await fetch(resolveApiUrl(`/public/bookings/${encodeURIComponent(clean)}`));
+      const rawText = await res.text().catch(() => '');
+      const outage = detectServiceOutage({
+        status: res.status,
+        contentType: res.headers.get('content-type'),
+        bodyText: rawText,
+        retryAfterHeader: res.headers.get('retry-after'),
+      });
+      if (outage.isOutage) {
+        recordServiceOutage(outage.reason, res.status, outage.retryAfterMs);
+        throw new Error(outage.reason);
+      }
+      const json = (rawText ? JSON.parse(rawText) : {}) as LookupBookingStatus & { error?: string };
       if (!res.ok) throw new Error(json.error || 'Không tìm thấy mã đăng ký.');
       setLookupResult(json);
     } catch (err) {
@@ -515,7 +691,10 @@ export function CustomerPortalPage({ onGoToStaffLogin }: CustomerPortalPageProps
           <div className="flex items-center gap-2 shrink-0">
             <button
               type="button"
-              onClick={loadAvailability}
+              onClick={() => {
+                clearServiceOutage();
+                loadAvailability(true);
+              }}
               aria-label="Làm mới danh sách phòng trống"
               className="min-h-[40px] inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
             >
@@ -605,9 +784,32 @@ export function CustomerPortalPage({ onGoToStaffLogin }: CustomerPortalPageProps
           </button>
         </div>
 
-        {error && (
-          <div role="alert" className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
-            {error}
+        {(error || cachedNoticeAt) && (
+          <div
+            role="alert"
+            className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950 flex flex-wrap items-center justify-between gap-3"
+          >
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="h-4 w-4 text-amber-700 shrink-0 mt-0.5" />
+              <div>
+                <div>{error || 'Đang hiển thị bảng phòng lưu tạm gần nhất.'}</div>
+                {cachedNoticeAt && (
+                  <div className="text-xs text-amber-800 mt-0.5">
+                    Dữ liệu đệm cập nhật lúc {formatDateTimeVN(cachedNoticeAt)}.
+                  </div>
+                )}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                clearServiceOutage();
+                loadAvailability(true);
+              }}
+              className="rounded-md border border-amber-300 bg-white px-3 py-1.5 text-xs font-semibold text-amber-900 hover:bg-amber-100"
+            >
+              Thử tải lại
+            </button>
           </div>
         )}
 

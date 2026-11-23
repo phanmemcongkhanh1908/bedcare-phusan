@@ -1,3 +1,11 @@
+import {
+  detectServiceOutage,
+  isServiceInOutageCooldown,
+  recordServiceOutage,
+  resolveApiUrl,
+  shouldAutoRetryOfflineItem,
+} from './networkResilience';
+
 export interface OfflinePendingAction {
   id: string;
   path: string;
@@ -7,6 +15,8 @@ export interface OfflinePendingAction {
   createdAt: string;
   attempts: number;
   lastError?: string | null;
+  lastStatus?: number | null;
+  permanentError?: boolean;
 }
 
 const QUEUE_KEY = 'bedcare_offline_pending_actions_v1';
@@ -72,6 +82,8 @@ export function enqueueOfflineAction(input: {
     createdAt: new Date().toISOString(),
     attempts: 0,
     lastError: input.lastError ?? 'Chờ kết nối mạng để phát đồng bộ',
+    lastStatus: null,
+    permanentError: false,
   };
   const next = [...getOfflineQueue(), item];
   saveOfflineQueue(next);
@@ -87,12 +99,16 @@ export function clearOfflineQueue() {
   saveOfflineQueue([]);
 }
 
-let inFlightFlush: Promise<{ flushed: number; failed: number; remaining: number }> | null = null;
+let inFlightFlush: Promise<{ flushed: number; failed: number; remaining: number; haltedByOutage?: boolean }> | null = null;
 
-export async function flushOfflineQueue(token: string | null): Promise<{
+export async function flushOfflineQueue(
+  token: string | null,
+  options: { includePermanentErrors?: boolean } = {}
+): Promise<{
   flushed: number;
   failed: number;
   remaining: number;
+  haltedByOutage?: boolean;
 }> {
   if (inFlightFlush) {
     return inFlightFlush;
@@ -104,11 +120,32 @@ export async function flushOfflineQueue(token: string | null): Promise<{
       return { flushed: 0, failed: 0, remaining: 0 };
     }
 
+    if (!options.includePermanentErrors && isServiceInOutageCooldown()) {
+      return {
+        flushed: 0,
+        failed: 0,
+        remaining: current.length,
+        haltedByOutage: true,
+      };
+    }
+
     let flushed = 0;
     let failed = 0;
+    let haltedByOutage = false;
     const remainingItems: OfflinePendingAction[] = [];
 
-    for (const item of current) {
+    for (let i = 0; i < current.length; i++) {
+      const item = current[i];
+      if (!options.includePermanentErrors && item.permanentError) {
+        remainingItems.push(item);
+        continue;
+      }
+
+      if (haltedByOutage) {
+        remainingItems.push(item);
+        continue;
+      }
+
       try {
         const headers: Record<string, string> = {
           'Content-Type': 'application/json',
@@ -116,27 +153,66 @@ export async function flushOfflineQueue(token: string | null): Promise<{
         if (token) {
           headers['Authorization'] = `Bearer ${token}`;
         }
-        const res = await fetch(`/api${item.path}`, {
+        const res = await fetch(resolveApiUrl(item.path), {
           method: item.method,
           headers,
           body: item.bodyText ?? undefined,
         });
-        if (res.ok) {
-          flushed++;
-        } else {
-          const errBody = (await res.json().catch(() => ({}))) as { error?: string };
+
+        const rawText = await res.text().catch(() => '');
+        const outage = detectServiceOutage({
+          status: res.status,
+          contentType: res.headers.get('content-type'),
+          bodyText: rawText,
+          retryAfterHeader: res.headers.get('retry-after'),
+        });
+
+        if (outage.isOutage) {
+          recordServiceOutage(outage.reason, res.status, outage.retryAfterMs);
           failed++;
+          haltedByOutage = true;
           remainingItems.push({
             ...item,
             attempts: item.attempts + 1,
-            lastError: errBody.error || `Lỗi máy chủ (${res.status})`,
+            lastStatus: res.status,
+            lastError: outage.reason,
+          });
+          continue;
+        }
+
+        if (res.ok) {
+          flushed++;
+        } else {
+          let errMsg = `Lỗi máy chủ (${res.status})`;
+          try {
+            const parsed = JSON.parse(rawText) as { error?: string };
+            if (parsed.error) errMsg = parsed.error;
+          } catch {
+            // Keep default HTTP error message
+          }
+          failed++;
+          const nextAttempts = item.attempts + 1;
+          const canRetry = shouldAutoRetryOfflineItem(nextAttempts, res.status);
+          remainingItems.push({
+            ...item,
+            attempts: nextAttempts,
+            lastStatus: res.status,
+            permanentError: !canRetry,
+            lastError: canRetry
+              ? errMsg
+              : `${errMsg} — Đã dừng tự động gửi lại để tránh lặp lỗi.`,
           });
         }
       } catch (err) {
         failed++;
+        haltedByOutage = true;
+        const nextAttempts = item.attempts + 1;
+        const canRetry = shouldAutoRetryOfflineItem(nextAttempts, null);
         remainingItems.push({
           ...item,
-          attempts: item.attempts + 1,
+          attempts: nextAttempts,
+          lastStatus: null,
+          permanentError: !canRetry,
           lastError: err instanceof Error ? err.message : 'Mất kết nối mạng',
         });
       }
@@ -147,7 +223,7 @@ export async function flushOfflineQueue(token: string | null): Promise<{
     const newlyQueued = getOfflineQueue().filter((x) => !currentIds.has(x.id));
     const finalQueue = [...remainingItems, ...newlyQueued];
     saveOfflineQueue(finalQueue);
-    return { flushed, failed, remaining: finalQueue.length };
+    return { flushed, failed, remaining: finalQueue.length, haltedByOutage };
   })().finally(() => {
     inFlightFlush = null;
   });

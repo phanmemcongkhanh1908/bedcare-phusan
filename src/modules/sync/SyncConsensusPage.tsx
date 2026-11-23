@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { apiFetch, getAuthToken } from '../../services/api';
 import type { Bed, UserRole } from '../../types/bedcare';
 import { formatDateTimeVN } from '../../utils/formatters';
+import { clearServiceOutage } from '../../utils/networkResilience';
 import {
   clearOfflineQueue,
   flushOfflineQueue,
@@ -122,9 +123,10 @@ export function SyncConsensusPage({ userRole, onNotify }: SyncConsensusPageProps
       return;
     }
     setRetryingSync(true);
+    clearServiceOutage();
     try {
       const token = getAuthToken();
-      const flushRes = await flushOfflineQueue(token);
+      const flushRes = await flushOfflineQueue(token, { includePermanentErrors: true });
       syncLocalQueueState();
 
       const reconcileRes = await apiFetch<{

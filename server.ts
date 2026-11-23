@@ -5,6 +5,7 @@ import { WebSocketServer } from 'ws';
 import { ensureDefaultAdminAccount, seedDemoClusterIfEmpty } from './src/server/demoData';
 import { BedcareCluster } from './src/server/p2pCluster';
 import { createBedcareRouter } from './src/server/router';
+import { createDebouncedBroadcaster } from './src/utils/serverGuards';
 
 async function startServer() {
   const app = express();
@@ -24,7 +25,7 @@ async function startServer() {
     ? path.resolve(process.env.BEDCARE_DATA_DIR)
     : path.resolve(process.cwd(), 'data');
 
-  const broadcastClusterSync = () => {
+  const sendClusterSync = () => {
     const msg = JSON.stringify({ type: 'CLUSTER_EVENT_SYNC', timestamp: new Date().toISOString() });
     for (const client of wss.clients) {
       if (client.readyState === 1) {
@@ -33,9 +34,12 @@ async function startServer() {
     }
   };
 
+  // Coalesce burst commits (Excel import, HIS sync, demo seed) into 1 WS broadcast per 300ms
+  const debouncedBroadcast = createDebouncedBroadcaster(sendClusterSync, 300);
+
   const cluster = new BedcareCluster({
     dataDir,
-    onClusterUpdate: broadcastClusterSync,
+    onClusterUpdate: debouncedBroadcast.trigger,
   });
   seedDemoClusterIfEmpty(cluster);
   ensureDefaultAdminAccount(cluster);
@@ -68,9 +72,26 @@ async function startServer() {
       }
     }
   }, 25000);
-  server.on('close', () => clearInterval(keepAliveTimer));
+  server.on('close', () => {
+    clearInterval(keepAliveTimer);
+    debouncedBroadcast.cancel();
+  });
 
   app.use(express.json({ limit: '25mb' }));
+
+  // Enable CORS & no-store on /api so PWA or standby failover mirror instances can respond cleanly
+  app.use('/api', (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Cache-Control', 'no-store');
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
   app.use('/api', createBedcareRouter(cluster));
 
   // Serve generated deliverables for direct download if present
@@ -107,8 +128,31 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distPath));
+    app.use(
+      express.static(distPath, {
+        setHeaders: (res, filePath) => {
+          if (
+            filePath.endsWith('.html') ||
+            filePath.endsWith('sw.js') ||
+            filePath.endsWith('registerSW.js') ||
+            filePath.endsWith('manifest.webmanifest')
+          ) {
+            res.setHeader('Cache-Control', 'no-cache');
+            return;
+          }
+          if (
+            filePath.includes(`${path.sep}assets${path.sep}`) ||
+            filePath.includes(`${path.sep}fonts${path.sep}`)
+          ) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+            return;
+          }
+          res.setHeader('Cache-Control', 'public, max-age=86400');
+        },
+      })
+    );
     app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-cache');
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }

@@ -238,7 +238,7 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
 
 let cachedFontBase64: { normal: string; bold: string } | null = null;
 
-async function loadDejaVuFonts(): Promise<{ normal: string; bold: string } | null> {
+export async function loadDejaVuFonts(): Promise<{ normal: string; bold: string } | null> {
   if (typeof window === 'undefined' || typeof fetch !== 'function') return null;
   if (cachedFontBase64) return cachedFontBase64;
   try {

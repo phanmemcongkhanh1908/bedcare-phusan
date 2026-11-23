@@ -3,6 +3,7 @@ import { useEffect, useState, type ChangeEvent } from 'react';
 import { ConfirmModal } from '../../components/ConfirmModal';
 import { apiFetch, getAuthToken } from '../../services/api';
 import { formatDateTimeVN } from '../../utils/formatters';
+import { resolveApiUrl } from '../../utils/networkResilience';
 
 interface BackupRecord {
   id: string;
@@ -67,7 +68,7 @@ export function BackupRestorePage({ onNotify }: BackupRestorePageProps) {
   const handleDownload = async (b: BackupRecord) => {
     try {
       const token = getAuthToken();
-      const res = await fetch(`/api/backups/${b.id}/download`, {
+      const res = await fetch(resolveApiUrl(`/backups/${b.id}/download`), {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
       if (!res.ok) {

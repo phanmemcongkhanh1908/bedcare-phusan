@@ -40,6 +40,7 @@ import {
   predict4HourBedVacancies,
   predict7DayCapacity,
 } from '../utils/vacancyPredictor';
+import { SlidingWindowRateLimiter } from '../utils/serverGuards';
 import { hashPassword, verifyPassword } from './crypto';
 import { getConfigMap } from './db';
 import { clearDemoOperationalData, seedDemoClusterIfEmpty } from './demoData';
@@ -242,6 +243,7 @@ export function createBedcareRouter(cluster: BedcareCluster) {
 
   // --- HEALTH ---
   router.get('/health', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     const active = cluster.getActiveNode();
     res.json({
       ok: true,
@@ -249,6 +251,22 @@ export function createBedcareRouter(cluster: BedcareCluster) {
       nodeCount: cluster.nodes.size,
       quorumRequired: cluster.getRequiredQuorum(),
     });
+  });
+
+  // Protect unauthenticated customer portal endpoints against polling/flood storms
+  const publicPortalLimiter = new SlidingWindowRateLimiter(90, 60_000);
+  router.use('/public', (req, res, next) => {
+    const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    const clientIp = forwarded || req.socket.remoteAddress || 'unknown';
+    const check = publicPortalLimiter.check(clientIp);
+    if (!check.allowed) {
+      res.setHeader('Retry-After', String(check.retryAfterSeconds));
+      res.status(429).json({
+        error: `Bạn đang gửi yêu cầu quá nhanh. Vui lòng thử lại sau ${check.retryAfterSeconds} giây.`,
+      });
+      return;
+    }
+    next();
   });
 
   // --- PUBLIC CUSTOMER PORTAL (UNAUTHENTICATED, ZERO PATIENT PII) ---
