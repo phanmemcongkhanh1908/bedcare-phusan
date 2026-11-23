@@ -778,6 +778,32 @@ export function seedDemoClusterIfEmpty(cluster: BedcareCluster) {
   });
 }
 
+export function getDatabaseSafetyCounts(db: import('node:sqlite').DatabaseSync) {
+  const countTable = (table: string, where = '') => {
+    const sql = where ? `SELECT COUNT(*) as c FROM ${table} WHERE ${where}` : `SELECT COUNT(*) as c FROM ${table}`;
+    return (db.prepare(sql).get() as { c: number }).c;
+  };
+  const demoRow = db
+    .prepare("SELECT value FROM system_configs WHERE key = 'demo_mode_active'")
+    .get() as { value: string } | undefined;
+
+  return {
+    demoModeActive: demoRow?.value === 'true',
+    patients: countTable('patients'),
+    activeAdmissions: countTable('admissions', "status = 'ACTIVE'"),
+    totalAdmissions: countTable('admissions'),
+    reservations: countTable('reservations'),
+    registrations: countTable('registrations'),
+    cleaningLogs: countTable('cleaning_logs'),
+    hisAssignments: countTable('his_bed_assignments'),
+    hisImportLogs: countTable('his_import_logs'),
+    departments: countTable('departments'),
+    rooms: countTable('rooms'),
+    beds: countTable('beds'),
+    users: countTable('users'),
+  };
+}
+
 export function clearDemoOperationalData(cluster: BedcareCluster, actorUserId: string) {
   for (const node of cluster.nodes.values()) {
     node.db.exec('PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;');
@@ -798,7 +824,7 @@ export function clearDemoOperationalData(cluster: BedcareCluster, actorUserId: s
       for (const t of opsTables) {
         node.db.exec(`DELETE FROM ${t}`);
       }
-      node.db.exec("UPDATE rooms SET exclusive_locked = 0, exclusive_lock_id = NULL");
+      node.db.exec("UPDATE rooms SET exclusive_locked = 0, exclusive_lock_id = NULL, occupancy_status = 'AVAILABLE'");
       node.db.exec("UPDATE beds SET status = 'VACANT', current_admission_id = NULL, current_reservation_id = NULL WHERE status != 'INACTIVE'");
       node.db.prepare("INSERT OR REPLACE INTO system_configs (key, value, updated_at) VALUES ('demo_mode_active', 'false', ?)").run(new Date().toISOString());
       node.db.exec('COMMIT; PRAGMA foreign_keys = ON;');
@@ -811,6 +837,53 @@ export function clearDemoOperationalData(cluster: BedcareCluster, actorUserId: s
   cluster.commitStandardEvent(active.deviceId, actorUserId, 'SYSTEM_CONFIG_UPDATE', 'CONFIG', 'system', {
     configs: { demo_mode_active: 'false' },
     audit_action: 'CLEAR_DEMO_DATA',
-    audit_details: 'Đã xóa toàn bộ dữ liệu bệnh nhân/lượt sử dụng mẫu trước khi vận hành thực tế',
+    audit_details: 'Đã tự động sao lưu an toàn và xóa toàn bộ dữ liệu bệnh nhân/lượt sử dụng mẫu trước khi vận hành thực tế',
+  });
+}
+
+export function purgeDatabaseRecords(
+  cluster: BedcareCluster,
+  actorUserId: string,
+  scope: 'OPERATIONAL_ONLY' | 'OPERATIONAL_AND_HIS'
+) {
+  for (const node of cluster.nodes.values()) {
+    node.db.exec('PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;');
+    try {
+      const opsTables = [
+        'cleaning_logs',
+        'transfer_requests',
+        'bed_transfers',
+        'bed_extensions',
+        'admissions',
+        'reservations',
+        'registrations',
+        'patients',
+        'pending_requests',
+        'conflicts',
+        'his_import_logs',
+      ];
+      if (scope === 'OPERATIONAL_AND_HIS') {
+        opsTables.push('his_bed_assignments', 'his_audit_resolutions');
+      }
+      for (const t of opsTables) {
+        node.db.exec(`DELETE FROM ${t}`);
+      }
+      node.db.exec("UPDATE rooms SET exclusive_locked = 0, exclusive_lock_id = NULL, occupancy_status = 'AVAILABLE'");
+      node.db.exec("UPDATE beds SET status = 'VACANT', current_admission_id = NULL, current_reservation_id = NULL WHERE status != 'INACTIVE'");
+      node.db.prepare("INSERT OR REPLACE INTO system_configs (key, value, updated_at) VALUES ('demo_mode_active', 'false', ?)").run(new Date().toISOString());
+      node.db.exec('COMMIT; PRAGMA foreign_keys = ON;');
+    } catch (e) {
+      node.db.exec('ROLLBACK; PRAGMA foreign_keys = ON;');
+      throw e;
+    }
+  }
+  const active = cluster.getActiveNode();
+  cluster.commitStandardEvent(active.deviceId, actorUserId, 'SYSTEM_CONFIG_UPDATE', 'CONFIG', 'system', {
+    configs: { demo_mode_active: 'false' },
+    audit_action: 'PURGE_DATABASE',
+    audit_details:
+      scope === 'OPERATIONAL_AND_HIS'
+        ? 'Đã tự động sao lưu và xóa sạch dữ liệu vận hành + đồng bộ HIS trong CSDL (giữ nguyên danh mục khoa/phòng/giường, tài khoản & lịch sử sao lưu)'
+        : 'Đã tự động sao lưu và xóa sạch dữ liệu bệnh nhân/giường bệnh vận hành trong CSDL (giữ nguyên danh mục, HIS, tài khoản & lịch sử sao lưu)',
   });
 }

@@ -6,19 +6,29 @@ import {
   Building2,
   Contrast,
   DoorOpen,
+  Download,
   Fan,
   Plus,
   QrCode,
+  RotateCcw,
   Server,
   Settings2,
+  ShieldAlert,
   SlidersHorizontal,
+  Trash2,
   Tv,
 } from 'lucide-react';
 import { useEffect, useState, type FormEvent } from 'react';
 import { HIGH_CONTRAST_EVENT } from '../../App';
 import { ConfirmModal } from '../../components/ConfirmModal';
 import { PortalQrPosterStudio } from './PortalQrPosterStudio';
-import { apiFetch } from '../../services/api';
+import { apiFetch, getAuthToken } from '../../services/api';
+import {
+  CLEAR_DEMO_CONFIRM_PHRASE,
+  PURGE_DB_CONFIRM_PHRASE,
+  describeBackupOrigin,
+  type DatabasePurgeScope,
+} from '../../utils/databaseSafety';
 import type {
   Bed,
   BedType,
@@ -36,6 +46,7 @@ import {
   getFailoverServerUrl,
   isUsingFailoverServer,
   normalizeServerBaseUrl,
+  resolveApiUrl,
   setActiveFailoverMode,
   setAutoSwitchFailover,
   setFailoverServerUrl,
@@ -65,7 +76,47 @@ export function SettingsPage({ userRole, onNotify, onDataChanged }: SettingsPage
   const [auditLogs, setAuditLogs] = useState<Array<Record<string, unknown>>>([]);
   const [newDiagName, setNewDiagName] = useState('');
   const [newDiagDays, setNewDiagDays] = useState(3);
-  const [confirmClearDemo, setConfirmClearDemo] = useState(false);
+  const [safetyCounts, setSafetyCounts] = useState<{
+    demoModeActive: boolean;
+    patients: number;
+    activeAdmissions: number;
+    totalAdmissions: number;
+    reservations: number;
+    registrations: number;
+    cleaningLogs: number;
+    hisAssignments: number;
+    hisImportLogs: number;
+    departments: number;
+    rooms: number;
+    beds: number;
+    users: number;
+  } | null>(null);
+  const [safetySnapshots, setSafetySnapshots] = useState<
+    Array<{
+      id: string;
+      backup_name: string;
+      device_id: string;
+      checksum_sha256: string;
+      record_count: number;
+      status: string;
+      created_by: string;
+      created_at: string;
+    }>
+  >([]);
+  const [lastSafetyBackup, setLastSafetyBackup] = useState<{
+    id: string;
+    backup_name: string;
+    record_count: number;
+    actionLabel: string;
+  } | null>(null);
+  const [purgeScope, setPurgeScope] = useState<DatabasePurgeScope>('OPERATIONAL_ONLY');
+  const [safetyModalMode, setSafetyModalMode] = useState<
+    null | { kind: 'CLEAR_DEMO' } | { kind: 'PURGE_DB' } | { kind: 'RESTORE_SNAPSHOT'; snapshot: { id: string; backup_name: string; record_count: number; created_at: string } }
+  >(null);
+  const [safetyPhraseInput, setSafetyPhraseInput] = useState('');
+  const [safetyPasswordInput, setSafetyPasswordInput] = useState('');
+  const [safetyModalError, setSafetyModalError] = useState('');
+  const [safetyBusy, setSafetyBusy] = useState(false);
   const [failoverUrlInput, setFailoverUrlInput] = useState(() => getFailoverServerUrl());
   const [autoFailover, setAutoFailover] = useState(() => getAutoSwitchFailover());
   const [usingFailover, setUsingFailover] = useState(() => isUsingFailoverServer());
@@ -137,13 +188,19 @@ export function SettingsPage({ userRole, onNotify, onDataChanged }: SettingsPage
 
   const load = async () => {
     try {
-      const [settingsRes, deptRes, roomRes, bedRes, btRes, stdRes] = await Promise.all([
+      const [settingsRes, deptRes, roomRes, bedRes, btRes, stdRes, safetyRes] = await Promise.all([
         apiFetch<{ configs: Record<string, string>; diagnoses: DiagnosisConfig[]; auditLogs: Array<Record<string, unknown>> }>('/settings'),
         apiFetch<Department[]>('/departments'),
         apiFetch<Room[]>('/rooms'),
         apiFetch<Bed[]>('/beds'),
         apiFetch<BedType[]>('/bed-types'),
         apiFetch<RoomStandard[]>('/room-standards'),
+        userRole === 'SUPER_ADMIN' || userRole === 'ADMIN'
+          ? apiFetch<{
+              counts: NonNullable<typeof safetyCounts>;
+              snapshots: typeof safetySnapshots;
+            }>('/settings/database-safety-summary').catch(() => null)
+          : Promise.resolve(null),
       ]);
       setConfigs(settingsRes.configs);
       setDiagnoses(settingsRes.diagnoses);
@@ -153,6 +210,10 @@ export function SettingsPage({ userRole, onNotify, onDataChanged }: SettingsPage
       setBeds(bedRes);
       setBedTypes(btRes);
       setStandards(stdRes);
+      if (safetyRes) {
+        setSafetyCounts(safetyRes.counts);
+        setSafetySnapshots(safetyRes.snapshots);
+      }
 
       if (!roomDeptId && deptRes.length > 0) setRoomDeptId(deptRes[0].id);
       if (!bedRoomId && roomRes.length > 0) setBedRoomId(roomRes[0].id);
@@ -355,16 +416,108 @@ export function SettingsPage({ userRole, onNotify, onDataChanged }: SettingsPage
     }
   };
 
-  const handleClearDemo = async () => {
+  const openSafetyModal = (
+    mode: NonNullable<typeof safetyModalMode>
+  ) => {
+    setSafetyPhraseInput('');
+    setSafetyPasswordInput('');
+    setSafetyModalError('');
+    setSafetyModalMode(mode);
+  };
+
+  const handleConfirmSafetyAction = async () => {
+    if (!safetyModalMode) return;
+    setSafetyBusy(true);
+    setSafetyModalError('');
     try {
-      await apiFetch('/settings/clear-demo-data', { method: 'POST' });
-      onNotify('Đã xóa sạch dữ liệu demo nghiệp vụ. Hệ thống sẵn sàng vận hành thực tế.');
-      setConfirmClearDemo(false);
+      if (safetyModalMode.kind === 'CLEAR_DEMO') {
+        const res = await apiFetch<{
+          ok: boolean;
+          safetyBackup: { id: string; backup_name: string; record_count: number };
+        }>('/settings/clear-demo-data', {
+          method: 'POST',
+          body: JSON.stringify({
+            password: safetyPasswordInput,
+            confirmPhrase: safetyPhraseInput,
+          }),
+        });
+        setLastSafetyBackup({
+          ...res.safetyBackup,
+          actionLabel: 'vừa xóa dữ liệu Demo',
+        });
+        onNotify(
+          `Đã tự động sao lưu (${res.safetyBackup.backup_name}) và xóa sạch dữ liệu demo.`
+        );
+      } else if (safetyModalMode.kind === 'PURGE_DB') {
+        const res = await apiFetch<{
+          ok: boolean;
+          safetyBackup: { id: string; backup_name: string; record_count: number };
+        }>('/settings/purge-database', {
+          method: 'POST',
+          body: JSON.stringify({
+            password: safetyPasswordInput,
+            confirmPhrase: safetyPhraseInput,
+            scope: purgeScope,
+          }),
+        });
+        setLastSafetyBackup({
+          ...res.safetyBackup,
+          actionLabel: 'vừa xóa dữ liệu trong CSDL',
+        });
+        onNotify(
+          `Đã tự động sao lưu (${res.safetyBackup.backup_name}) và xóa dữ liệu CSDL theo phạm vi đã chọn.`
+        );
+      } else if (safetyModalMode.kind === 'RESTORE_SNAPSHOT') {
+        const res = await apiFetch<{
+          ok: boolean;
+          preRestoreBackup?: { id: string; backup_name: string; record_count: number };
+        }>('/settings/restore-snapshot', {
+          method: 'POST',
+          body: JSON.stringify({
+            backupId: safetyModalMode.snapshot.id,
+            password: safetyPasswordInput,
+          }),
+        });
+        if (res.preRestoreBackup) {
+          setLastSafetyBackup({
+            ...res.preRestoreBackup,
+            actionLabel: 'khôi phục mốc',
+          });
+        }
+        onNotify(`Đã khôi phục toàn bộ CSDL về mốc ${safetyModalMode.snapshot.backup_name}.`);
+      }
+
+      setSafetyModalMode(null);
+      setSafetyPhraseInput('');
+      setSafetyPasswordInput('');
       await load();
       onDataChanged();
     } catch (err) {
+      setSafetyModalError((err as Error).message);
+    } finally {
+      setSafetyBusy(false);
+    }
+  };
+
+  const handleDownloadSafetyBackup = async (backupId: string, backupName: string) => {
+    try {
+      const token = getAuthToken();
+      const res = await fetch(resolveApiUrl(`/backups/${backupId}/download`), {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) throw new Error('Không thể tải file sao lưu.');
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = backupName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      onNotify(`Đã tải bản sao lưu an toàn ${backupName}.`);
+    } catch (err) {
       onNotify((err as Error).message, 'error');
-      setConfirmClearDemo(false);
     }
   };
 
@@ -1379,21 +1532,228 @@ export function SettingsPage({ userRole, onNotify, onDataChanged }: SettingsPage
             </div>
           </form>
 
-          {userRole === 'SUPER_ADMIN' && (
-            <div className="rounded-lg border border-rose-200 bg-rose-50/50 p-5 flex flex-wrap items-center justify-between gap-4">
-              <div>
-                <h3 className="text-base font-semibold text-rose-900">Dữ liệu Demo &amp; Triển khai chính thức</h3>
-                <p className="text-xs text-rose-800 mt-1">
-                  Xóa toàn bộ bệnh nhân mẫu, đăng ký mẫu và lượt sử dụng mẫu trước khi đưa bệnh viện vào vận hành thật (giữ nguyên tài khoản, danh mục khoa/phòng/giường và thiết bị).
-                </p>
+          {(userRole === 'SUPER_ADMIN' || userRole === 'ADMIN') && (
+            <div className="rounded-lg border border-rose-200 bg-white overflow-hidden">
+              <div className="bg-rose-50/70 border-b border-rose-200 px-5 py-4 flex flex-wrap items-start justify-between gap-4">
+                <div className="flex items-start gap-3">
+                  <ShieldAlert className="h-5 w-5 text-rose-700 shrink-0 mt-0.5" />
+                  <div>
+                    <h3 className="text-base font-semibold text-rose-950">
+                      An toàn CSDL: Xóa dữ liệu Demo, Xóa CSDL &amp; Khôi phục thao tác nhầm
+                    </h3>
+                    <p className="text-xs text-rose-900/90 mt-0.5">
+                      Mọi thao tác xóa dữ liệu đều bắt buộc xác thực mật khẩu + cụm xác nhận và <strong>tự động sao lưu mã hóa AES-256-GCM trước khi xóa</strong> để bạn có thể khôi phục lại ngay nếu thao tác nhầm.
+                    </p>
+                  </div>
+                </div>
               </div>
-              <button
-                type="button"
-                onClick={() => setConfirmClearDemo(true)}
-                className="rounded-md bg-rose-600 px-4 py-2 text-sm font-medium text-white hover:bg-rose-700 whitespace-nowrap"
-              >
-                Xóa sạch dữ liệu demo
-              </button>
+
+              <div className="p-5 space-y-5">
+                {/* Quick Undo Banner immediately after destructive action */}
+                {lastSafetyBackup && (
+                  <div
+                    role="status"
+                    data-testid="safety-undo-banner"
+                    className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 flex flex-wrap items-center justify-between gap-3"
+                  >
+                    <div className="text-xs text-amber-950">
+                      <strong>Đã tự động sao lưu trước khi {lastSafetyBackup.actionLabel}:</strong>{' '}
+                      <span className="font-mono">{lastSafetyBackup.backup_name}</span> ({lastSafetyBackup.record_count} bản ghi). Nếu lỡ thao tác nhầm, bấm hoàn tác ngay:
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        openSafetyModal({
+                          kind: 'RESTORE_SNAPSHOT',
+                          snapshot: {
+                            id: lastSafetyBackup.id,
+                            backup_name: lastSafetyBackup.backup_name,
+                            record_count: lastSafetyBackup.record_count,
+                            created_at: new Date().toISOString(),
+                          },
+                        })
+                      }
+                      className="inline-flex items-center gap-1.5 rounded-md bg-amber-700 px-3.5 py-2 text-xs font-semibold text-white hover:bg-amber-800 whitespace-nowrap"
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" />
+                      <span>Hoàn tác / Khôi phục ngay</span>
+                    </button>
+                  </div>
+                )}
+
+                {/* Live CSDL Record Counts */}
+                {safetyCounts && (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 text-xs">
+                    <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+                      <div className="text-slate-500">Bệnh nhân</div>
+                      <div className="font-mono tabular-nums text-base font-bold text-slate-900">{safetyCounts.patients}</div>
+                    </div>
+                    <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+                      <div className="text-slate-500">Đang nằm nội trú</div>
+                      <div className="font-mono tabular-nums text-base font-bold text-sky-800">{safetyCounts.activeAdmissions}</div>
+                    </div>
+                    <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+                      <div className="text-slate-500">Giữ chỗ phòng/giường</div>
+                      <div className="font-mono tabular-nums text-base font-bold text-slate-900">{safetyCounts.reservations}</div>
+                    </div>
+                    <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+                      <div className="text-slate-500">Đăng ký chờ</div>
+                      <div className="font-mono tabular-nums text-base font-bold text-slate-900">{safetyCounts.registrations}</div>
+                    </div>
+                    <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+                      <div className="text-slate-500">Dữ liệu HIS</div>
+                      <div className="font-mono tabular-nums text-base font-bold text-slate-900">{safetyCounts.hisAssignments}</div>
+                    </div>
+                    <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+                      <div className="text-slate-500">Khoa / Phòng / Giường</div>
+                      <div className="font-mono tabular-nums text-sm font-bold text-emerald-700">
+                        {safetyCounts.departments}/{safetyCounts.rooms}/{safetyCounts.beds}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {userRole === 'SUPER_ADMIN' && (
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                    {/* Clear Demo Card */}
+                    <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-4 flex flex-col justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-slate-900">
+                          1. Xóa dữ liệu Demo trước khi vận hành chính thức
+                        </div>
+                        <p className="text-xs text-slate-600 mt-1">
+                          Xóa bệnh nhân mẫu, đăng ký mẫu, giữ chỗ mẫu, lượt nằm và vệ sinh mẫu; giữ nguyên Khoa, Phòng, Giường, Đơn giá và Tài khoản. Tự động lưu bản <code>auto-pre-clear-demo</code> trước khi xóa.
+                        </p>
+                      </div>
+                      <div>
+                        <button
+                          type="button"
+                          data-testid="open-clear-demo-modal"
+                          onClick={() => openSafetyModal({ kind: 'CLEAR_DEMO' })}
+                          className="inline-flex items-center gap-1.5 rounded-md bg-amber-700 px-3.5 py-2 text-xs font-semibold text-white hover:bg-amber-800 whitespace-nowrap"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                          <span>Xóa sạch dữ liệu Demo</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Scoped CSDL Purge Card */}
+                    <div className="rounded-lg border border-rose-200 bg-rose-50/40 p-4 flex flex-col justify-between gap-3">
+                      <div className="space-y-2">
+                        <div className="text-sm font-semibold text-rose-950">
+                          2. Xóa dữ liệu vận hành trong CSDL (Reset dữ liệu bệnh nhân)
+                        </div>
+                        <p className="text-xs text-rose-900">
+                          Dùng khi cần làm sạch lại CSDL vận hành (luôn bảo vệ nguyên vẹn tài khoản người dùng, danh mục Khoa/Phòng/Giường và các bản sao lưu an toàn). Tự động tạo snapshot <code>auto-pre-purge-db</code> trước khi xóa.
+                        </p>
+                        <div>
+                          <label htmlFor="purge-scope-select" className="block text-[11px] font-medium text-rose-950 mb-1">
+                            Chọn phạm vi xóa trong CSDL:
+                          </label>
+                          <select
+                            id="purge-scope-select"
+                            value={purgeScope}
+                            onChange={(e) => setPurgeScope(e.target.value as DatabasePurgeScope)}
+                            className="w-full rounded-md border border-rose-300 bg-white px-2.5 py-1.5 text-xs text-slate-900"
+                          >
+                            <option value="OPERATIONAL_ONLY">Chỉ xóa dữ liệu Bệnh nhân, Đặt giường &amp; Lượt nằm (Giữ HIS)</option>
+                            <option value="OPERATIONAL_AND_HIS">Xóa dữ liệu Bệnh nhân, Đặt giường, Lượt nằm + Dữ liệu đồng bộ HIS</option>
+                          </select>
+                        </div>
+                      </div>
+                      <div>
+                        <button
+                          type="button"
+                          data-testid="open-purge-db-modal"
+                          onClick={() => openSafetyModal({ kind: 'PURGE_DB' })}
+                          className="inline-flex items-center gap-1.5 rounded-md bg-rose-700 px-3.5 py-2 text-xs font-semibold text-white hover:bg-rose-800 whitespace-nowrap"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                          <span>Xóa dữ liệu CSDL...</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Built-in Safety Snapshots Table for Immediate Restore */}
+                <div className="rounded-lg border border-slate-200 overflow-hidden">
+                  <div className="bg-slate-50 px-4 py-2.5 border-b border-slate-200 flex items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-slate-800">
+                      Điểm khôi phục tự động &amp; Bản sao lưu trong hệ thống ({safetySnapshots.length})
+                    </span>
+                    <span className="text-[11px] text-slate-500">
+                      Mỗi lần khôi phục cũng tự động sao lưu mốc trước đó
+                    </span>
+                  </div>
+                  <div className="overflow-x-auto max-h-64">
+                    <table className="w-full text-xs">
+                      <thead className="bg-slate-50/60 text-slate-500 border-b border-slate-200">
+                        <tr>
+                          <th className="px-3.5 py-2 text-left">Loại điểm lưu</th>
+                          <th className="px-3.5 py-2 text-left">Tên file .bcare</th>
+                          <th className="px-3.5 py-2 text-right">Bản ghi</th>
+                          <th className="px-3.5 py-2 text-left">Người tạo</th>
+                          <th className="px-3.5 py-2 text-left">Thời gian</th>
+                          <th className="px-3.5 py-2 text-right">Thao tác</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {safetySnapshots.length === 0 ? (
+                          <tr>
+                            <td colSpan={6} className="px-4 py-6 text-center text-slate-500">
+                              Chưa có điểm sao lưu an toàn nào. Hệ thống sẽ tự tạo mỗi khi có thao tác xóa hoặc sao lưu thủ công.
+                            </td>
+                          </tr>
+                        ) : (
+                          safetySnapshots.map((snap) => {
+                            const origin = describeBackupOrigin(snap.backup_name);
+                            return (
+                              <tr key={snap.id} className="hover:bg-slate-50">
+                                <td className="px-3.5 py-2 font-medium text-slate-800 whitespace-nowrap">
+                                  {origin.label}
+                                </td>
+                                <td className="px-3.5 py-2 font-mono text-[11px] text-slate-600">
+                                  {snap.backup_name}
+                                </td>
+                                <td className="px-3.5 py-2 text-right font-mono tabular-nums">
+                                  {snap.record_count}
+                                </td>
+                                <td className="px-3.5 py-2 text-slate-700">{snap.created_by}</td>
+                                <td className="px-3.5 py-2 font-mono text-slate-500 whitespace-nowrap">
+                                  {formatDateTimeVN(snap.created_at)}
+                                </td>
+                                <td className="px-3.5 py-2 text-right whitespace-nowrap">
+                                  <div className="inline-flex items-center gap-1.5">
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDownloadSafetyBackup(snap.id, snap.backup_name)}
+                                      className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100"
+                                    >
+                                      <Download className="h-3 w-3 text-sky-700" />
+                                      <span>Tải</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      data-testid={`restore-snapshot-${snap.id}`}
+                                      onClick={() => openSafetyModal({ kind: 'RESTORE_SNAPSHOT', snapshot: snap })}
+                                      className="inline-flex items-center gap-1 rounded border border-sky-200 bg-sky-50 px-2.5 py-1 text-[11px] font-semibold text-sky-800 hover:bg-sky-100"
+                                    >
+                                      <RotateCcw className="h-3 w-3" />
+                                      <span>Khôi phục mốc này</span>
+                                    </button>
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          })
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
             </div>
           )}
 
@@ -1428,13 +1788,69 @@ export function SettingsPage({ userRole, onNotify, onDataChanged }: SettingsPage
           </div>
 
           <ConfirmModal
-            open={confirmClearDemo}
-            title="Xóa dữ liệu demo trước khi dùng thật"
-            description="Hành động này sẽ xóa toàn bộ bệnh nhân mẫu, đăng ký mẫu, giữ chỗ mẫu và lượt nằm mẫu trên tất cả các máy trạm. Danh mục Khoa, Phòng, Giường và Tài khoản vẫn được giữ nguyên."
-            danger
-            confirmLabel="Xác nhận xóa dữ liệu demo"
-            onConfirm={handleClearDemo}
-            onCancel={() => setConfirmClearDemo(false)}
+            open={safetyModalMode !== null}
+            title={
+              safetyModalMode?.kind === 'CLEAR_DEMO'
+                ? 'Cảnh báo: Xóa dữ liệu Demo & Sao lưu dự phòng'
+                : safetyModalMode?.kind === 'PURGE_DB'
+                  ? 'Cảnh báo nghiêm trọng: Xóa dữ liệu CSDL vận hành'
+                  : 'Xác nhận khôi phục CSDL từ điểm sao lưu an toàn'
+            }
+            description={
+              safetyModalMode?.kind === 'CLEAR_DEMO'
+                ? 'Toàn bộ bệnh nhân, phiếu đăng ký, giữ chỗ, lượt nằm nội trú và nhật ký vệ sinh hiện có sẽ bị xóa sạch để đưa bệnh viện vào vận hành chính thức. Danh mục Khoa, Phòng, Giường và Tài khoản vẫn được giữ nguyên.'
+                : safetyModalMode?.kind === 'PURGE_DB'
+                  ? `Hành động này sẽ xóa toàn bộ dữ liệu bệnh nhân và giao dịch giường bệnh${
+                      purgeScope === 'OPERATIONAL_AND_HIS' ? ' bao gồm cả dữ liệu đồng bộ từ HIS' : ''
+                    } trên tất cả máy trạm. Tài khoản đăng nhập, danh mục Khoa/Phòng/Giường và các bản sao lưu an toàn vẫn được giữ nguyên.`
+                  : `Bạn sắp hoàn tác toàn bộ CSDL hệ thống về mốc "${safetyModalMode?.snapshot.backup_name}" (${safetyModalMode?.snapshot.record_count} bản ghi). Mọi thay đổi phát sinh sau thời điểm này sẽ được thay thế bằng dữ liệu của mốc đã chọn.`
+            }
+            impactItems={
+              safetyCounts
+                ? [
+                    { label: 'Bệnh nhân', value: safetyCounts.patients },
+                    { label: 'Đang nằm nội trú', value: safetyCounts.activeAdmissions },
+                    { label: 'Giữ chỗ phòng', value: safetyCounts.reservations },
+                    { label: 'Đăng ký chờ', value: safetyCounts.registrations },
+                    { label: 'Lượt nằm tổng', value: safetyCounts.totalAdmissions },
+                    { label: 'Dữ liệu HIS', value: safetyCounts.hisAssignments },
+                  ]
+                : undefined
+            }
+            autoBackupNote={
+              safetyModalMode?.kind === 'RESTORE_SNAPSHOT'
+                ? 'An toàn 2 lớp: Trước khi khôi phục về mốc cũ, hệ thống vẫn tự động sao lưu trạng thái hiện tại (auto-pre-restore) để bạn có thể quay lại nếu chọn nhầm mốc.'
+                : 'Bảo vệ dữ liệu: Ngay trước khi xóa, hệ thống tự động tạo bản sao lưu mã hóa AES-256-GCM vào danh sách Điểm khôi phục để bạn hoàn tác tức thì nếu lỡ thao tác nhầm.'
+            }
+            danger={safetyModalMode?.kind !== 'RESTORE_SNAPSHOT'}
+            requireConfirmPhrase={
+              safetyModalMode?.kind === 'CLEAR_DEMO'
+                ? CLEAR_DEMO_CONFIRM_PHRASE
+                : safetyModalMode?.kind === 'PURGE_DB'
+                  ? PURGE_DB_CONFIRM_PHRASE
+                  : undefined
+            }
+            confirmInput={safetyPhraseInput}
+            onConfirmInputChange={setSafetyPhraseInput}
+            requirePassword
+            passwordValue={safetyPasswordInput}
+            onPasswordChange={setSafetyPasswordInput}
+            errorMessage={safetyModalError}
+            busy={safetyBusy}
+            confirmLabel={
+              safetyModalMode?.kind === 'CLEAR_DEMO'
+                ? 'Sao lưu & Xóa dữ liệu Demo'
+                : safetyModalMode?.kind === 'PURGE_DB'
+                  ? 'Sao lưu & Xóa dữ liệu CSDL'
+                  : 'Xác nhận khôi phục CSDL'
+            }
+            onConfirm={handleConfirmSafetyAction}
+            onCancel={() => {
+              if (!safetyBusy) {
+                setSafetyModalMode(null);
+                setSafetyModalError('');
+              }
+            }}
           />
         </div>
       )}

@@ -358,11 +358,15 @@ test('Full-stack API verifies FK fixes, Smart Match, >30m Delay Transfer Request
     const uploadRestoreRes = await fetch(`${baseUrl}/backups/upload-restore`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ fileName: 'test.bcare', envelope: downloadedEnvelope }),
+      body: JSON.stringify({ fileName: 'test.bcare', envelope: downloadedEnvelope, password: 'admin' }),
     });
     assert.equal(uploadRestoreRes.status, 200);
 
-    const rstRes = await fetch(`${baseUrl}/backups/${bk.id}/restore`, { method: 'POST', headers });
+    const rstRes = await fetch(`${baseUrl}/backups/${bk.id}/restore`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ password: 'admin' }),
+    });
     assert.equal(rstRes.status, 200);
     assert.ok(cluster.getActiveNode().db.prepare('SELECT COUNT(*) as c FROM transfer_requests').get());
 

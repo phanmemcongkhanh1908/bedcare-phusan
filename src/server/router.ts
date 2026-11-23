@@ -40,10 +40,21 @@ import {
   predict4HourBedVacancies,
   predict7DayCapacity,
 } from '../utils/vacancyPredictor';
+import {
+  CLEAR_DEMO_CONFIRM_PHRASE,
+  PURGE_DB_CONFIRM_PHRASE,
+  matchesConfirmPhrase,
+  type DatabasePurgeScope,
+} from '../utils/databaseSafety';
 import { SlidingWindowRateLimiter } from '../utils/serverGuards';
 import { hashPassword, verifyPassword } from './crypto';
 import { getConfigMap } from './db';
-import { clearDemoOperationalData, seedDemoClusterIfEmpty } from './demoData';
+import {
+  clearDemoOperationalData,
+  getDatabaseSafetyCounts,
+  purgeDatabaseRecords,
+  seedDemoClusterIfEmpty,
+} from './demoData';
 import {
   BedcareCluster,
   ConsensusConflictError,
@@ -168,6 +179,16 @@ export function createBedcareRouter(cluster: BedcareCluster) {
       return false;
     }
     return true;
+  };
+
+  const verifyActorPassword = (userId: string, password: unknown): boolean => {
+    if (typeof password !== 'string' || password.length === 0) return false;
+    const db = cluster.getActiveNode().db;
+    const row = db
+      .prepare('SELECT password_hash, status FROM users WHERE id = ?')
+      .get(userId) as { password_hash: string; status: string } | undefined;
+    if (!row || row.status !== 'ACTIVE') return false;
+    return verifyPassword(password, row.password_hash);
   };
 
   const getScopedDeptId = (user?: AuthUser): string | null => {
@@ -3828,8 +3849,10 @@ export function createBedcareRouter(cluster: BedcareCluster) {
 
   router.post('/backups/upload-restore', requireAuth, requireRoles('SUPER_ADMIN', 'ADMIN'), async (req: AuthedRequest, res) => {
     try {
-      const { fileName, envelope } = req.body as {
+      const { fileName, envelope, password, authoritative } = req.body as {
         fileName?: string;
+        password?: string;
+        authoritative?: boolean;
         envelope: {
           version: string;
           algorithm: 'aes-256-gcm';
@@ -3839,11 +3862,19 @@ export function createBedcareRouter(cluster: BedcareCluster) {
           checksum_sha256: string;
         };
       };
+      if (!verifyActorPassword(req.authUser!.id, password)) {
+        res.status(403).json({ error: 'Vui lòng nhập đúng mật khẩu xác thực quản trị viên.' });
+        return;
+      }
       const result = await cluster.restoreFromUploadedEnvelope(
         cluster.activeNodeId,
         fileName || `backup-${Date.now()}.bcare`,
         envelope,
-        req.authUser!.username
+        req.authUser!.username,
+        {
+          createPreRestoreBackup: true,
+          authoritativeAllNodes: Boolean(authoritative),
+        }
       );
       res.json(result);
     } catch (e) {
@@ -3853,7 +3884,20 @@ export function createBedcareRouter(cluster: BedcareCluster) {
 
   router.post('/backups/:id/restore', requireAuth, requireRoles('SUPER_ADMIN', 'ADMIN'), async (req: AuthedRequest, res) => {
     try {
-      const result = await cluster.restoreEncryptedBackup(cluster.activeNodeId, req.params.id, req.authUser!.username);
+      const body = (req.body || {}) as { password?: string; authoritative?: boolean };
+      if (!verifyActorPassword(req.authUser!.id, body.password)) {
+        res.status(403).json({ error: 'Vui lòng nhập đúng mật khẩu xác thực quản trị viên.' });
+        return;
+      }
+      const result = await cluster.restoreEncryptedBackup(
+        cluster.activeNodeId,
+        req.params.id,
+        req.authUser!.username,
+        {
+          createPreRestoreBackup: true,
+          authoritativeAllNodes: Boolean(body.authoritative),
+        }
+      );
       res.json(result);
     } catch (e) {
       res.status(400).json({ error: (e as Error).message });
@@ -3904,20 +3948,111 @@ export function createBedcareRouter(cluster: BedcareCluster) {
     res.status(201).json({ id: diagId });
   });
 
-  router.post('/settings/clear-demo-data', requireAuth, requireRoles('SUPER_ADMIN'), (req: AuthedRequest, res) => {
-    clearDemoOperationalData(cluster, req.authUser!.id);
-    res.json({ ok: true });
+  router.get('/settings/database-safety-summary', requireAuth, requireRoles('SUPER_ADMIN', 'ADMIN'), (_req, res) => {
+    const db = cluster.getActiveNode().db;
+    const counts = getDatabaseSafetyCounts(db);
+    const snapshots = db
+      .prepare('SELECT id, backup_name, device_id, checksum_sha256, record_count, status, created_by, created_at FROM backups ORDER BY created_at DESC LIMIT 20')
+      .all();
+    res.json({
+      counts,
+      demoModeActive: counts.demoModeActive,
+      snapshots,
+    });
   });
 
-  router.post('/settings/seed-demo-data', requireAuth, requireRoles('SUPER_ADMIN'), (_req, res) => {
+  router.post('/settings/clear-demo-data', requireAuth, requireRoles('SUPER_ADMIN'), (req: AuthedRequest, res) => {
+    const { password, confirmPhrase } = (req.body || {}) as { password?: string; confirmPhrase?: string };
+    if (!verifyActorPassword(req.authUser!.id, password)) {
+      res.status(403).json({ error: 'Mật khẩu xác thực không đúng. Đã hủy thao tác xóa dữ liệu demo.' });
+      return;
+    }
+    if (!matchesConfirmPhrase(confirmPhrase, CLEAR_DEMO_CONFIRM_PHRASE)) {
+      res.status(400).json({
+        error: `Vui lòng nhập đúng cụm xác nhận "${CLEAR_DEMO_CONFIRM_PHRASE}" trước khi xóa dữ liệu demo.`,
+      });
+      return;
+    }
+
+    const countsBefore = getDatabaseSafetyCounts(cluster.getActiveNode().db);
+    const safetyBackup = cluster.createEncryptedBackup(cluster.activeNodeId, req.authUser!.username, {
+      prefix: 'auto-pre-clear-demo',
+    });
+    clearDemoOperationalData(cluster, req.authUser!.id);
+    res.json({ ok: true, safetyBackup, countsBefore });
+  });
+
+  router.post('/settings/purge-database', requireAuth, requireRoles('SUPER_ADMIN'), (req: AuthedRequest, res) => {
+    const { password, confirmPhrase, scope } = (req.body || {}) as {
+      password?: string;
+      confirmPhrase?: string;
+      scope?: DatabasePurgeScope;
+    };
+    if (!verifyActorPassword(req.authUser!.id, password)) {
+      res.status(403).json({ error: 'Mật khẩu xác thực không đúng. Đã hủy thao tác xóa dữ liệu CSDL.' });
+      return;
+    }
+    if (!matchesConfirmPhrase(confirmPhrase, PURGE_DB_CONFIRM_PHRASE)) {
+      res.status(400).json({
+        error: `Vui lòng nhập đúng cụm xác nhận "${PURGE_DB_CONFIRM_PHRASE}" để xác thực xóa dữ liệu CSDL.`,
+      });
+      return;
+    }
+    const targetScope: DatabasePurgeScope =
+      scope === 'OPERATIONAL_AND_HIS' ? 'OPERATIONAL_AND_HIS' : 'OPERATIONAL_ONLY';
+
+    const countsBefore = getDatabaseSafetyCounts(cluster.getActiveNode().db);
+    const safetyBackup = cluster.createEncryptedBackup(cluster.activeNodeId, req.authUser!.username, {
+      prefix: 'auto-pre-purge-db',
+    });
+    purgeDatabaseRecords(cluster, req.authUser!.id, targetScope);
+    res.json({ ok: true, safetyBackup, scope: targetScope, countsBefore });
+  });
+
+  router.post('/settings/restore-snapshot', requireAuth, requireRoles('SUPER_ADMIN', 'ADMIN'), async (req: AuthedRequest, res) => {
+    const { backupId, password } = (req.body || {}) as { backupId?: string; password?: string };
+    if (!backupId || typeof backupId !== 'string') {
+      res.status(400).json({ error: 'Thiếu mã bản sao lưu cần khôi phục.' });
+      return;
+    }
+    if (!verifyActorPassword(req.authUser!.id, password)) {
+      res.status(403).json({ error: 'Mật khẩu xác thực không đúng. Đã hủy thao tác khôi phục.' });
+      return;
+    }
+    try {
+      const result = await cluster.restoreEncryptedBackup(
+        cluster.activeNodeId,
+        backupId,
+        req.authUser!.username,
+        { authoritativeAllNodes: true, createPreRestoreBackup: true }
+      );
+      res.json({
+        ok: true,
+        restoredBackupId: backupId,
+        checksumVerified: result.checksumVerified,
+        preRestoreBackup: result.preRestoreBackup,
+      });
+    } catch (e) {
+      res.status(400).json({ error: (e as Error).message });
+    }
+  });
+
+  router.post('/settings/seed-demo-data', requireAuth, requireRoles('SUPER_ADMIN'), (req: AuthedRequest, res) => {
+    const { password } = (req.body || {}) as { password?: string };
+    if (!verifyActorPassword(req.authUser!.id, password)) {
+      res.status(403).json({ error: 'Mật khẩu xác thực không đúng. Không thể khởi tạo lại dữ liệu mẫu.' });
+      return;
+    }
     const node = cluster.getActiveNode();
     const admCount = (node.db.prepare('SELECT COUNT(*) as c FROM admissions').get() as { c: number }).c;
+    let safetyBackup: ReturnType<BedcareCluster['createEncryptedBackup']> | undefined;
     if (admCount === 0) {
-      // Re-seed operational demo data safely only if empty
-      node.db.exec('DELETE FROM users');
+      safetyBackup = cluster.createEncryptedBackup(cluster.activeNodeId, req.authUser!.username, {
+        prefix: 'auto-pre-seed-demo',
+      });
       seedDemoClusterIfEmpty(cluster);
     }
-    res.json({ ok: true });
+    res.json({ ok: true, safetyBackup });
   });
 
   // --- HIS INTEGRATION, BED MAPPING & BHYT COMPLIANCE AUDIT ---

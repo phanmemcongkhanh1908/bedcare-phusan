@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
+import { sanitizeBackupPrefix } from '../utils/databaseSafety';
 import {
   decryptBackupPayload,
   encryptBackupPayload,
@@ -815,32 +816,43 @@ export class BedcareCluster {
     });
   }
 
-  public createEncryptedBackup(nodeId: string, actorUsername: string) {
+  private static readonly BACKUP_TABLES = [
+    'departments',
+    'room_standards',
+    'bed_types',
+    'rooms',
+    'beds',
+    'patients',
+    'diagnosis_configs',
+    'registrations',
+    'reservations',
+    'admissions',
+    'bed_extensions',
+    'bed_transfers',
+    'transfer_requests',
+    'cleaning_logs',
+    'his_import_logs',
+    'his_bed_mappings',
+    'his_bed_assignments',
+    'his_audit_resolutions',
+    'pending_requests',
+    'conflicts',
+    'users',
+    'devices',
+    'events',
+    'consensus_log',
+    'system_configs',
+  ] as const;
+
+  public createEncryptedBackup(
+    nodeId: string,
+    actorUsername: string,
+    options?: { prefix?: string }
+  ) {
     const node = this.getNode(nodeId);
-    const tables = [
-      'departments',
-      'room_standards',
-      'bed_types',
-      'rooms',
-      'beds',
-      'patients',
-      'diagnosis_configs',
-      'registrations',
-      'reservations',
-      'admissions',
-      'bed_extensions',
-      'bed_transfers',
-      'transfer_requests',
-      'cleaning_logs',
-      'users',
-      'devices',
-      'events',
-      'consensus_log',
-      'system_configs',
-    ];
     const snapshot: Record<string, unknown[]> = {};
     let recordCount = 0;
-    for (const t of tables) {
+    for (const t of BedcareCluster.BACKUP_TABLES) {
       const rows = node.db.prepare(`SELECT * FROM ${t}`).all() as Record<string, unknown>[];
       snapshot[t] = rows;
       recordCount += rows.length;
@@ -859,7 +871,8 @@ export class BedcareCluster {
 
     const envelope = encryptBackupPayload(payloadJson);
     const backupId = `bkp-${crypto.randomUUID().slice(0, 8)}`;
-    const backupName = `bedcare-backup-${node.deviceId}-${new Date().toISOString().replace(/[:.]/g, '-')}.bcare`;
+    const prefix = sanitizeBackupPrefix(options?.prefix);
+    const backupName = `${prefix}-${node.deviceId}-${new Date().toISOString().replace(/[:.]/g, '-')}.bcare`;
     const backupDir = path.join(this.dataDir, 'backups');
     if (node.dbPath !== ':memory:' && !fs.existsSync(backupDir)) {
       fs.mkdirSync(backupDir, { recursive: true });
@@ -947,7 +960,8 @@ export class BedcareCluster {
     nodeId: string,
     fileName: string,
     envelope: EncryptedBackupEnvelope,
-    actorUsername: string
+    actorUsername: string,
+    options?: { authoritativeAllNodes?: boolean; createPreRestoreBackup?: boolean }
   ) {
     if (
       !envelope ||
@@ -967,6 +981,11 @@ export class BedcareCluster {
     };
     if (parsed.meta?.schema_version !== '1.0.0') {
       throw new Error(`Phiên bản cấu trúc dữ liệu không tương thích: ${parsed.meta?.schema_version || 'unknown'}`);
+    }
+
+    let preRestoreBackup: ReturnType<BedcareCluster['createEncryptedBackup']> | undefined;
+    if (options?.createPreRestoreBackup) {
+      preRestoreBackup = this.createEncryptedBackup(nodeId, actorUsername, { prefix: 'auto-pre-restore' });
     }
 
     const node = this.getNode(nodeId);
@@ -1003,13 +1022,56 @@ export class BedcareCluster {
         new Date().toISOString()
       );
 
-    return this.restoreEncryptedBackup(nodeId, backupId, actorUsername);
+    const restored = await this.restoreEncryptedBackup(nodeId, backupId, actorUsername, {
+      authoritativeAllNodes: options?.authoritativeAllNodes,
+      createPreRestoreBackup: false,
+    });
+    return {
+      ...restored,
+      preRestoreBackup: preRestoreBackup ?? restored.preRestoreBackup,
+    };
   }
 
-  public async restoreEncryptedBackup(nodeId: string, backupId: string, actorUsername: string) {
+  private applySnapshotTablesToDb(
+    targetDb: DatabaseSync,
+    tables: Record<string, Record<string, unknown>[]>
+  ) {
+    const restoreOrder = [...BedcareCluster.BACKUP_TABLES];
+    targetDb.exec('PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;');
+    try {
+      for (const table of [...restoreOrder].reverse()) {
+        targetDb.exec(`DELETE FROM ${table}`);
+      }
+      for (const table of restoreOrder) {
+        const rows = tables[table] ?? [];
+        if (rows.length === 0) continue;
+        const validCols = new Set(
+          (targetDb.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name)
+        );
+        const cols = Object.keys(rows[0]).filter((col) => validCols.has(col));
+        if (cols.length === 0) continue;
+        const placeholders = cols.map(() => '?').join(',');
+        const stmt = targetDb.prepare(`INSERT INTO ${table} (${cols.join(',')}) VALUES (${placeholders})`);
+        for (const r of rows) {
+          stmt.run(...cols.map((c) => r[c] as string | number | null));
+        }
+      }
+      targetDb.exec('COMMIT; PRAGMA foreign_keys = ON;');
+    } catch (e) {
+      targetDb.exec('ROLLBACK; PRAGMA foreign_keys = ON;');
+      throw e;
+    }
+  }
+
+  public async restoreEncryptedBackup(
+    nodeId: string,
+    backupId: string,
+    actorUsername: string,
+    options?: { authoritativeAllNodes?: boolean; createPreRestoreBackup?: boolean }
+  ) {
     const node = this.getNode(nodeId);
     const bkpRow = node.db.prepare('SELECT * FROM backups WHERE id = ?').get(backupId) as
-      | { id: string; file_path: string; checksum_sha256: string }
+      | { id: string; backup_name: string; file_path: string; checksum_sha256: string }
       | undefined;
     if (!bkpRow) throw new Error('Không tìm thấy bản sao lưu.');
 
@@ -1025,53 +1087,46 @@ export class BedcareCluster {
       throw new Error(`Phiên bản cấu trúc dữ liệu không tương thích: ${parsed.meta.schema_version}`);
     }
 
-    // Restore local snapshot without blindly overwriting newer consensus events:
-    // Step 1: Restore base tables from verified snapshot
-    const restoreOrder = [
-      'departments',
-      'room_standards',
-      'bed_types',
-      'rooms',
-      'beds',
-      'patients',
-      'diagnosis_configs',
-      'registrations',
-      'reservations',
-      'admissions',
-      'bed_extensions',
-      'bed_transfers',
-      'transfer_requests',
-      'cleaning_logs',
-      'users',
-      'devices',
-      'events',
-      'consensus_log',
-      'system_configs',
-    ];
-
-    node.db.exec('PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;');
-    try {
-      for (const table of [...restoreOrder].reverse()) {
-        node.db.exec(`DELETE FROM ${table}`);
-      }
-      for (const table of restoreOrder) {
-        const rows = parsed.tables[table] ?? [];
-        if (rows.length === 0) continue;
-        const cols = Object.keys(rows[0]);
-        const placeholders = cols.map(() => '?').join(',');
-        const stmt = node.db.prepare(`INSERT INTO ${table} (${cols.join(',')}) VALUES (${placeholders})`);
-        for (const r of rows) {
-          stmt.run(...cols.map((c) => r[c] as string | number | null));
-        }
-      }
-      node.db.prepare("UPDATE backups SET status = 'RESTORED' WHERE id = ?").run(backupId);
-      node.db.exec('COMMIT; PRAGMA foreign_keys = ON;');
-    } catch (e) {
-      node.db.exec('ROLLBACK; PRAGMA foreign_keys = ON;');
-      throw e;
+    let preRestoreBackup: ReturnType<BedcareCluster['createEncryptedBackup']> | undefined;
+    if (options?.createPreRestoreBackup) {
+      preRestoreBackup = this.createEncryptedBackup(nodeId, actorUsername, { prefix: 'auto-pre-restore' });
     }
 
-    // Step 2: Reconcile against reachable quorum peers so newer committed transactions are preserved!
+    if (options?.authoritativeAllNodes) {
+      for (const peer of this.nodes.values()) {
+        this.applySnapshotTablesToDb(peer.db, parsed.tables);
+      }
+      node.db.prepare("UPDATE backups SET status = 'RESTORED' WHERE id = ?").run(backupId);
+      const now = new Date().toISOString();
+      for (const peer of this.nodes.values()) {
+        peer.db
+          .prepare(
+            `INSERT INTO audit_logs (id, user_id, username, device_id, action, entity_type, entity_id, details, created_at)
+             VALUES (?, ?, ?, ?, 'RESTORE_SAFETY_SNAPSHOT', 'BACKUP', ?, ?, ?)`
+          )
+          .run(
+            `aud-${crypto.randomUUID()}`,
+            actorUsername,
+            actorUsername,
+            peer.deviceId,
+            backupId,
+            `Khôi phục khẩn cấp toàn cụm về bản sao lưu ${bkpRow.backup_name} (${backupId}).`,
+            now
+          );
+      }
+      this.onClusterUpdate?.();
+      return {
+        restored: true,
+        reconciledEvents: 0,
+        checksumVerified: sha256Hex(decryptedJson) === bkpRow.checksum_sha256,
+        preRestoreBackup,
+      };
+    }
+
+    // Default P2P recovery: restore local node tables then reconcile newer quorum events
+    this.applySnapshotTablesToDb(node.db, parsed.tables);
+    node.db.prepare("UPDATE backups SET status = 'RESTORED' WHERE id = ?").run(backupId);
+
     const syncResult = await this.reconcileCluster();
     node.db
       .prepare(
@@ -1092,6 +1147,7 @@ export class BedcareCluster {
       restored: true,
       reconciledEvents: syncResult.syncedEvents,
       checksumVerified: sha256Hex(decryptedJson) === bkpRow.checksum_sha256,
+      preRestoreBackup,
     };
   }
 }

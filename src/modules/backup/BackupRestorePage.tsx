@@ -1,7 +1,8 @@
-import { CheckCircle2, DatabaseBackup, Download, FileCheck2, ShieldCheck, Upload } from 'lucide-react';
+import { CheckCircle2, DatabaseBackup, Download, FileCheck2, RotateCcw, ShieldCheck, Upload } from 'lucide-react';
 import { useEffect, useState, type ChangeEvent } from 'react';
 import { ConfirmModal } from '../../components/ConfirmModal';
 import { apiFetch, getAuthToken } from '../../services/api';
+import { describeBackupOrigin } from '../../utils/databaseSafety';
 import { formatDateTimeVN } from '../../utils/formatters';
 import { resolveApiUrl } from '../../utils/networkResilience';
 
@@ -31,6 +32,9 @@ export function BackupRestorePage({ onNotify }: BackupRestorePageProps) {
   const [restoring, setRestoring] = useState(false);
   const [verifyingId, setVerifyingId] = useState<string | null>(null);
   const [verifiedMap, setVerifiedMap] = useState<Record<string, boolean>>({});
+  const [restorePassword, setRestorePassword] = useState('');
+  const [restoreError, setRestoreError] = useState('');
+  const [lastPreRestoreBackup, setLastPreRestoreBackup] = useState<BackupRecord | null>(null);
   const [uploadCandidate, setUploadCandidate] = useState<{
     fileName: string;
     envelope: Record<string, unknown>;
@@ -121,6 +125,8 @@ export function BackupRestorePage({ onNotify }: BackupRestorePageProps) {
       if (parsed.algorithm !== 'aes-256-gcm' || !parsed.ciphertext || !parsed.checksum_sha256) {
         throw new Error('File không đúng định dạng sao lưu mã hóa .bcare của BEDCARE.');
       }
+      setRestorePassword('');
+      setRestoreError('');
       setUploadCandidate({
         fileName: file.name,
         envelope: parsed,
@@ -134,25 +140,33 @@ export function BackupRestorePage({ onNotify }: BackupRestorePageProps) {
   const handleConfirmUploadRestore = async () => {
     if (!uploadCandidate) return;
     setRestoring(true);
+    setRestoreError('');
     try {
-      const res = await apiFetch<{ restored: boolean; reconciledEvents: number; checksumVerified: boolean }>(
-        '/backups/upload-restore',
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            fileName: uploadCandidate.fileName,
-            envelope: uploadCandidate.envelope,
-          }),
-        }
-      );
+      const res = await apiFetch<{
+        restored: boolean;
+        reconciledEvents: number;
+        checksumVerified: boolean;
+        preRestoreBackup?: BackupRecord;
+      }>('/backups/upload-restore', {
+        method: 'POST',
+        body: JSON.stringify({
+          fileName: uploadCandidate.fileName,
+          envelope: uploadCandidate.envelope,
+          password: restorePassword,
+          authoritative: true,
+        }),
+      });
+      if (res.preRestoreBackup) {
+        setLastPreRestoreBackup(res.preRestoreBackup);
+      }
       onNotify(
-        `Đã khôi phục từ file ${uploadCandidate.fileName} (Checksum hợp lệ: ${res.checksumVerified ? 'Có' : 'Không'}, đối chiếu P2P +${res.reconciledEvents} sự kiện).`
+        `Đã sao lưu mốc cũ và khôi phục từ file ${uploadCandidate.fileName} (Checksum hợp lệ: ${res.checksumVerified ? 'Có' : 'Không'}).`
       );
       setUploadCandidate(null);
+      setRestorePassword('');
       await load();
     } catch (err) {
-      onNotify((err as Error).message, 'error');
-      setUploadCandidate(null);
+      setRestoreError((err as Error).message);
     } finally {
       setRestoring(false);
     }
@@ -161,19 +175,31 @@ export function BackupRestorePage({ onNotify }: BackupRestorePageProps) {
   const handleRestore = async () => {
     if (!restoreTarget) return;
     setRestoring(true);
+    setRestoreError('');
     try {
-      const res = await apiFetch<{ restored: boolean; reconciledEvents: number; checksumVerified: boolean }>(
-        `/backups/${restoreTarget.id}/restore`,
-        { method: 'POST' }
-      );
+      const res = await apiFetch<{
+        restored: boolean;
+        reconciledEvents: number;
+        checksumVerified: boolean;
+        preRestoreBackup?: BackupRecord;
+      }>(`/backups/${restoreTarget.id}/restore`, {
+        method: 'POST',
+        body: JSON.stringify({
+          password: restorePassword,
+          authoritative: true,
+        }),
+      });
+      if (res.preRestoreBackup) {
+        setLastPreRestoreBackup(res.preRestoreBackup);
+      }
       onNotify(
-        `Khôi phục thành công (Checksum hợp lệ: ${res.checksumVerified ? 'Có' : 'Không'}). Đã đối chiếu đồng thuận +${res.reconciledEvents} sự kiện mới từ cụm P2P.`
+        `Khôi phục thành công (Checksum hợp lệ: ${res.checksumVerified ? 'Có' : 'Không'}). Đã tự động lưu mốc dự phòng trước khôi phục.`
       );
       setRestoreTarget(null);
+      setRestorePassword('');
       await load();
     } catch (err) {
-      onNotify((err as Error).message, 'error');
-      setRestoreTarget(null);
+      setRestoreError((err as Error).message);
     } finally {
       setRestoring(false);
     }
@@ -218,6 +244,30 @@ export function BackupRestorePage({ onNotify }: BackupRestorePageProps) {
         </div>
       </div>
 
+      {lastPreRestoreBackup && (
+        <div
+          role="status"
+          className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 flex flex-wrap items-center justify-between gap-3"
+        >
+          <div className="text-xs text-amber-950">
+            <strong>Hệ thống vừa tự lưu trạng thái trước khi khôi phục:</strong>{' '}
+            <span className="font-mono">{lastPreRestoreBackup.backup_name}</span>. Nếu vừa chọn nhầm bản sao lưu, bấm hoàn tác ngay:
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setRestorePassword('');
+              setRestoreError('');
+              setRestoreTarget(lastPreRestoreBackup);
+            }}
+            className="inline-flex items-center gap-1.5 rounded-md bg-amber-700 px-3.5 py-2 text-xs font-semibold text-white hover:bg-amber-800 whitespace-nowrap"
+          >
+            <RotateCcw className="h-3.5 w-3.5" />
+            <span>Hoàn tác lần khôi phục vừa rồi</span>
+          </button>
+        </div>
+      )}
+
       {/* Desktop Table */}
       <div className="hidden md:block rounded-lg border border-slate-200 bg-white overflow-hidden">
         <div className="overflow-x-auto">
@@ -238,7 +288,10 @@ export function BackupRestorePage({ onNotify }: BackupRestorePageProps) {
                 <tr><td colSpan={7} className="px-4 py-8 text-center text-slate-500">Chưa có bản sao lưu nào trên máy trạm này.</td></tr>
               ) : backups.map((b) => (
                 <tr key={b.id} className="hover:bg-slate-50">
-                  <td className="px-4 py-3 font-medium text-slate-900">{b.backup_name}</td>
+                  <td className="px-4 py-3">
+                    <div className="font-medium text-slate-900">{b.backup_name}</div>
+                    <div className="text-[11px] text-slate-500 mt-0.5">{describeBackupOrigin(b.backup_name).label}</div>
+                  </td>
                   <td className="px-4 py-3 font-mono text-xs text-slate-600">{b.device_id} · v{b.app_version}</td>
                   <td className="px-4 py-3 font-mono text-[11px] text-slate-500 max-w-[150px] truncate">{b.checksum_sha256}</td>
                   <td className="px-4 py-3 text-right font-mono tabular-nums">{b.record_count}</td>
@@ -274,7 +327,11 @@ export function BackupRestorePage({ onNotify }: BackupRestorePageProps) {
                       </button>
                       <button
                         type="button"
-                        onClick={() => setRestoreTarget(b)}
+                        onClick={() => {
+                          setRestorePassword('');
+                          setRestoreError('');
+                          setRestoreTarget(b);
+                        }}
                         className="rounded-md border border-sky-200 bg-sky-50 px-2.5 py-1.5 text-xs font-medium text-sky-800 hover:bg-sky-100"
                       >
                         Khôi phục
@@ -328,7 +385,11 @@ export function BackupRestorePage({ onNotify }: BackupRestorePageProps) {
               </button>
               <button
                 type="button"
-                onClick={() => setRestoreTarget(b)}
+                onClick={() => {
+                  setRestorePassword('');
+                  setRestoreError('');
+                  setRestoreTarget(b);
+                }}
                 className="min-h-[42px] inline-flex items-center justify-center rounded-md bg-sky-700 px-2 py-1.5 text-xs font-semibold text-white"
               >
                 Khôi phục
@@ -340,22 +401,44 @@ export function BackupRestorePage({ onNotify }: BackupRestorePageProps) {
 
       <ConfirmModal
         open={Boolean(restoreTarget)}
-        title="Khôi phục dữ liệu từ bản sao lưu"
-        description={`Khôi phục từ ${restoreTarget?.backup_name}? Hệ thống sẽ kiểm tra toàn vẹn SHA-256, giải mã AES-256-GCM và đối chiếu lại toàn bộ sự kiện đồng thuận mới hơn trên mạng P2P.`}
-        confirmLabel="Bắt đầu khôi phục"
+        title="Cảnh báo: Khôi phục dữ liệu từ bản sao lưu"
+        description={`Khôi phục từ ${restoreTarget?.backup_name} (${restoreTarget?.record_count ?? 0} bản ghi)? Dữ liệu hiện tại trên cụm sẽ được thay thế bằng bản sao lưu này sau khi kiểm tra toàn vẹn SHA-256 và giải mã AES-256-GCM.`}
+        autoBackupNote="An toàn chống ghi nhầm: Trước khi khôi phục, hệ thống sẽ tự động lưu lại một bản dự phòng (auto-pre-restore) của CSDL hiện tại để bạn có thể hoàn tác bất kỳ lúc nào."
+        danger
+        requirePassword
+        passwordValue={restorePassword}
+        onPasswordChange={setRestorePassword}
+        errorMessage={restoreError}
+        confirmLabel="Xác thực & Bắt đầu khôi phục"
         busy={restoring}
         onConfirm={handleRestore}
-        onCancel={() => setRestoreTarget(null)}
+        onCancel={() => {
+          if (!restoring) {
+            setRestoreTarget(null);
+            setRestoreError('');
+          }
+        }}
       />
 
       <ConfirmModal
         open={Boolean(uploadCandidate)}
-        title="Khôi phục dữ liệu từ file .bcare tải lên"
-        description={`Xác nhận giải mã & khôi phục dữ liệu từ file "${uploadCandidate?.fileName}" (SHA-256: ${uploadCandidate?.checksum.slice(0, 16)}...)? Dữ liệu hiện tại sẽ được đồng bộ lại theo chuẩn an toàn.`}
-        confirmLabel="Xác nhận khôi phục"
+        title="Cảnh báo: Khôi phục dữ liệu từ file .bcare tải lên"
+        description={`Xác nhận giải mã & khôi phục dữ liệu từ file "${uploadCandidate?.fileName}" (SHA-256: ${uploadCandidate?.checksum.slice(0, 16)}...)?`}
+        autoBackupNote="An toàn chống ghi nhầm: Trước khi nạp file mới đè lên CSDL hiện tại, hệ thống sẽ tự động tạo một bản sao lưu dự phòng (auto-pre-restore) để bạn hoàn tác nếu chọn nhầm file."
+        danger
+        requirePassword
+        passwordValue={restorePassword}
+        onPasswordChange={setRestorePassword}
+        errorMessage={restoreError}
+        confirmLabel="Xác thực & Nạp khôi phục"
         busy={restoring}
         onConfirm={handleConfirmUploadRestore}
-        onCancel={() => setUploadCandidate(null)}
+        onCancel={() => {
+          if (!restoring) {
+            setUploadCandidate(null);
+            setRestoreError('');
+          }
+        }}
       />
     </div>
   );
